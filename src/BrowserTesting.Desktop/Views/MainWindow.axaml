@@ -1,0 +1,241 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="clr-namespace:BrowserTesting.Desktop.ViewModels"
+        x:Class="BrowserTesting.Desktop.Views.MainWindow"
+        Width="1500"
+        Height="900"
+        MinWidth="1100"
+        MinHeight="700"
+        Background="#0A1520"
+        Foreground="#E8EEF6"
+        Title="LLM Browser Tester">
+  <Window.DataTemplates>
+    <DataTemplate DataType="vm:UserTimelineItemViewModel">
+      <Border Classes="card" Background="#1E3350">
+        <StackPanel Spacing="6">
+          <TextBlock Text="You" FontWeight="Bold" />
+          <SelectableTextBlock Text="{Binding Content}" TextWrapping="Wrap" />
+          <TextBlock Text="{Binding Timestamp}" HorizontalAlignment="Right" Opacity="0.65" />
+        </StackPanel>
+      </Border>
+    </DataTemplate>
+
+    <DataTemplate DataType="vm:AssistantTimelineItemViewModel">
+      <Border Classes="card">
+        <StackPanel Spacing="6">
+          <TextBlock Text="Assistant" FontWeight="Bold" />
+          <SelectableTextBlock Text="{Binding Content}" TextWrapping="Wrap" />
+          <TextBlock Text="{Binding Timestamp}" HorizontalAlignment="Right" Opacity="0.65" />
+        </StackPanel>
+      </Border>
+    </DataTemplate>
+
+    <DataTemplate DataType="vm:ToolStartedTimelineItemViewModel">
+      <Border Classes="card" Background="#182839">
+        <StackPanel Spacing="4">
+          <TextBlock Text="{Binding ToolName}" FontWeight="Bold" />
+          <SelectableTextBlock Text="{Binding Summary}" TextWrapping="Wrap" />
+          <SelectableTextBlock Text="{Binding ArgumentsPreview}" FontFamily="Consolas, Courier New, monospace" Opacity="0.75" TextWrapping="Wrap" />
+        </StackPanel>
+      </Border>
+    </DataTemplate>
+
+    <DataTemplate DataType="vm:ToolFinishedTimelineItemViewModel">
+      <Border Classes="card">
+        <StackPanel Spacing="4">
+          <TextBlock Text="{Binding ToolName}" FontWeight="Bold" />
+          <SelectableTextBlock Text="{Binding Summary}" Foreground="{Binding StatusBrush}" TextWrapping="Wrap" />
+          <SelectableTextBlock Text="{Binding ResultJson}" FontFamily="Consolas, Courier New, monospace" Opacity="0.75" TextWrapping="Wrap" />
+        </StackPanel>
+      </Border>
+    </DataTemplate>
+
+    <DataTemplate DataType="vm:GoalChangedTimelineItemViewModel">
+      <Border Classes="card" Background="#15281B">
+        <StackPanel Spacing="4">
+          <TextBlock Text="Goal Update" FontWeight="Bold" />
+          <SelectableTextBlock Text="{Binding Content}" TextWrapping="Wrap" />
+        </StackPanel>
+      </Border>
+    </DataTemplate>
+
+    <DataTemplate DataType="vm:SystemTimelineItemViewModel">
+      <Border Classes="card" Background="#1B2430">
+        <SelectableTextBlock Text="{Binding Content}" TextWrapping="Wrap" />
+      </Border>
+    </DataTemplate>
+  </Window.DataTemplates>
+
+  <Grid ColumnDefinitions="260,*,320" RowDefinitions="*">
+    <Border Grid.Column="0" BorderBrush="#213041" BorderThickness="0,0,1,0" Padding="16">
+      <DockPanel LastChildFill="True">
+        <Button DockPanel.Dock="Top" Content="New Chat" Command="{Binding NewChatCommand}" Margin="0,0,0,12" />
+        <TextBlock DockPanel.Dock="Bottom" Text="{Binding StatusText}" TextWrapping="Wrap" Opacity="0.75" Margin="0,12,0,0" />
+        <ListBox ItemsSource="{Binding Chats}" SelectedItem="{Binding SelectedChat}">
+          <ListBox.ItemTemplate>
+            <DataTemplate DataType="vm:ChatListItemViewModel">
+              <Border Padding="10" Margin="0,0,0,8" Background="#122030" CornerRadius="8">
+                <StackPanel Spacing="3">
+                  <TextBlock Text="{Binding Title}" FontWeight="Bold" />
+                  <TextBlock Text="{Binding Subtitle}" FontSize="11" Opacity="0.7" TextWrapping="Wrap" />
+                </StackPanel>
+              </Border>
+            </DataTemplate>
+          </ListBox.ItemTemplate>
+        </ListBox>
+      </DockPanel>
+    </Border>
+
+    <Grid Grid.Column="1" RowDefinitions="Auto,*,Auto" Margin="18">
+      <Border Grid.Row="0" Classes="card" Margin="0,0,0,10">
+        <DockPanel LastChildFill="False">
+          <StackPanel Orientation="Horizontal" Spacing="10">
+            <Button Content="Export Chat" Command="{Binding ExportChatCommand}" />
+            <CheckBox Content="Selection Mode" IsChecked="{Binding IsSelectionModeEnabled}" VerticalAlignment="Center" />
+            <Button Content="Settings" Command="{Binding Settings.OpenCommand}" />
+          </StackPanel>
+          <TextBlock DockPanel.Dock="Right"
+                     Margin="12,0,0,0"
+                     VerticalAlignment="Center"
+                     Text="Selection mode lets you drag across the full transcript."
+                     Opacity="0.7"
+                     IsVisible="{Binding IsSelectionModeEnabled}" />
+        </DockPanel>
+      </Border>
+
+      <ScrollViewer Grid.Row="1" IsVisible="{Binding IsTimelineVisible}">
+        <ItemsControl ItemsSource="{Binding Timeline}" />
+      </ScrollViewer>
+
+      <TextBox Grid.Row="1"
+               IsVisible="{Binding IsSelectionTranscriptVisible}"
+               Text="{Binding SelectionTranscriptText}"
+               IsReadOnly="True"
+               AcceptsReturn="True"
+               TextWrapping="Wrap"
+               VerticalContentAlignment="Top"
+               HorizontalContentAlignment="Stretch"
+               FontSize="13"
+               Background="#101C29"
+               BorderBrush="#2A3B4D"
+               BorderThickness="1"
+               Padding="12" />
+
+      <Border Grid.Row="1" Classes="card" IsVisible="{Binding Settings.IsOpen}">
+        <ScrollViewer>
+          <StackPanel Spacing="14">
+            <StackPanel Spacing="4">
+              <TextBlock Text="LLM Settings" FontWeight="Bold" FontSize="18" />
+              <TextBlock Text="Changes are saved locally and apply to new runs only." Opacity="0.8" TextWrapping="Wrap" />
+            </StackPanel>
+
+            <StackPanel Spacing="6">
+              <TextBlock Text="Provider" FontWeight="Bold" />
+              <ComboBox ItemsSource="{Binding Settings.ProviderOptions}"
+                        SelectedItem="{Binding Settings.SelectedProviderOption}"
+                        MinWidth="220" />
+            </StackPanel>
+
+            <StackPanel Spacing="6">
+              <TextBlock Text="Model" FontWeight="Bold" />
+              <DockPanel LastChildFill="False">
+                <ComboBox ItemsSource="{Binding Settings.AvailableModels}"
+                          SelectedItem="{Binding Settings.SelectedModel}"
+                          MinWidth="360" />
+                <Button DockPanel.Dock="Right"
+                        Margin="12,0,0,0"
+                        Content="Refresh models"
+                        Command="{Binding Settings.RefreshModelsCommand}" />
+              </DockPanel>
+              <TextBlock Text="{Binding Settings.ModelStatusText}" Opacity="0.75" TextWrapping="Wrap" />
+            </StackPanel>
+
+            <Border Classes="card" IsVisible="{Binding Settings.IsOpenAiSelected}" Margin="0">
+              <StackPanel Spacing="10">
+                <TextBlock Text="OpenAI" FontWeight="Bold" />
+                <TextBlock Text="Saved on this machine with Windows data protection." Opacity="0.75" TextWrapping="Wrap" />
+                <TextBlock Text="API Key" FontWeight="Bold" />
+                <TextBox Text="{Binding Settings.OpenAiApiKey, Mode=TwoWay}"
+                         PasswordChar="*"
+                         Watermark="sk-..."
+                         MinWidth="360" />
+                <Button Content="Clear Saved Key"
+                        HorizontalAlignment="Left"
+                        Command="{Binding Settings.ClearApiKeyCommand}" />
+              </StackPanel>
+            </Border>
+
+            <TextBlock Text="{Binding Settings.ValidationMessage}"
+                       Foreground="IndianRed"
+                       TextWrapping="Wrap"
+                       IsVisible="{Binding Settings.HasValidationMessage}" />
+
+            <StackPanel Orientation="Horizontal" Spacing="10">
+              <Button Content="Save"
+                      Command="{Binding Settings.SaveCommand}" />
+              <Button Content="Cancel"
+                      Command="{Binding Settings.CancelCommand}" />
+            </StackPanel>
+          </StackPanel>
+        </ScrollViewer>
+      </Border>
+
+      <Border Grid.Row="2" Classes="card" Margin="0,10,0,0" IsVisible="{Binding IsComposerVisible}">
+        <Grid ColumnDefinitions="*,Auto" RowDefinitions="Auto,Auto">
+          <TextBlock Grid.ColumnSpan="2" Text="Describe the test you want to run" FontWeight="Bold" />
+          <TextBox Grid.Row="1"
+                   AcceptsReturn="True"
+                   TextWrapping="Wrap"
+                   MinHeight="90"
+                   Margin="0,8,12,0"
+                   Text="{Binding ComposerText, Mode=TwoWay}" />
+          <Button Grid.Row="1" Grid.Column="1" Margin="0,8,0,0" VerticalAlignment="Bottom" Content="Run Test" Command="{Binding SendCommand}" />
+        </Grid>
+      </Border>
+    </Grid>
+
+    <Border Grid.Column="2" BorderBrush="#213041" BorderThickness="1,0,0,0" Padding="16">
+      <ScrollViewer>
+        <StackPanel Spacing="12">
+          <Border Classes="card">
+            <StackPanel Spacing="6">
+              <TextBlock Text="Current Run" FontWeight="Bold" />
+              <TextBlock Text="{Binding SelectedRunTitle}" TextWrapping="Wrap" />
+            </StackPanel>
+          </Border>
+
+          <Border Classes="card">
+            <StackPanel Spacing="6">
+              <TextBlock Text="Browser Status" FontWeight="Bold" />
+              <TextBlock Text="{Binding BrowserStatus}" />
+              <TextBlock Text="{Binding BrowserUrl}" TextWrapping="Wrap" />
+              <TextBlock Text="{Binding BrowserTitle}" TextWrapping="Wrap" />
+              <TextBlock Text="{Binding RestoreStatus}" />
+            </StackPanel>
+          </Border>
+
+          <Border Classes="card">
+            <StackPanel Spacing="10">
+              <TextBlock Text="Goals" FontWeight="Bold" />
+              <ItemsControl ItemsSource="{Binding Goals}">
+                <ItemsControl.ItemTemplate>
+                  <DataTemplate DataType="vm:GoalItemViewModel">
+                    <Border Padding="10" Margin="0,0,0,8" Background="#102230" CornerRadius="8">
+                      <StackPanel Spacing="4">
+                        <TextBlock Text="{Binding Title}" FontWeight="Bold" />
+                        <TextBlock Text="{Binding SuccessCriteria}" TextWrapping="Wrap" FontSize="12" Opacity="0.8" />
+                        <TextBlock Text="{Binding StatusText}" Foreground="{Binding StatusBrush}" />
+                        <TextBlock Text="{Binding Note}" TextWrapping="Wrap" />
+                        <TextBlock Text="{Binding Evidence}" TextWrapping="Wrap" Opacity="0.8" />
+                      </StackPanel>
+                    </Border>
+                  </DataTemplate>
+                </ItemsControl.ItemTemplate>
+              </ItemsControl>
+            </StackPanel>
+          </Border>
+        </StackPanel>
+      </ScrollViewer>
+    </Border>
+  </Grid>
+</Window>

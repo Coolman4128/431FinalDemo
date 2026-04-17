@@ -1,0 +1,59 @@
+using BrowserTesting.Core.Models;
+using BrowserTesting.Core.Services;
+using BrowserTesting.Desktop.Services;
+using BrowserTesting.Desktop.ViewModels;
+using BrowserTesting.Desktop.Views;
+using BrowserTesting.Infrastructure.Browser;
+using BrowserTesting.Infrastructure.Llm;
+using BrowserTesting.Infrastructure.Persistence;
+using BrowserTesting.Infrastructure.Secrets;
+using BrowserTesting.Infrastructure.Settings;
+using BrowserTesting.Infrastructure.Tools;
+using Avalonia;
+using Avalonia.Controls.ApplicationLifetimes;
+using Avalonia.Markup.Xaml;
+using System.Runtime.Versioning;
+
+namespace BrowserTesting.Desktop;
+
+[SupportedOSPlatform("windows")]
+public partial class App : Application
+{
+    public override void Initialize() =>
+        AvaloniaXamlLoader.Load(this);
+
+    public override void OnFrameworkInitializationCompleted()
+    {
+        if (ApplicationLifetime is IClassicDesktopStyleApplicationLifetime desktop)
+        {
+            var settings = AppSettings.CreateDefault(AppContext.BaseDirectory);
+            var settingsStore = new JsonAppSettingsStore();
+            settingsStore.LoadAsync(settings, CancellationToken.None).GetAwaiter().GetResult();
+            var repository = new SqliteChatRepository(settings);
+            var browserSessionManager = new BrowserSessionManager(settings);
+            var secretStore = new DpapiSecretStore(repository);
+            var goalService = new GoalService(repository);
+            var toolRegistry = new ToolRegistry();
+            var toolExecutor = new ToolExecutor(browserSessionManager, goalService, repository, secretStore, toolRegistry);
+            var llmClient = new LmStudioLlmClient(new HttpClient
+            {
+                Timeout = TimeSpan.FromMinutes(10),
+            });
+            var orchestrator = new ChatOrchestrator(
+                repository,
+                llmClient,
+                toolRegistry,
+                toolExecutor,
+                browserSessionManager,
+                secretStore,
+                settings);
+            var llmSettingsService = new LlmSettingsService(settings, settingsStore, llmClient);
+
+            var mainWindow = new MainWindow();
+            mainWindow.DataContext = new MainWindowViewModel(orchestrator, new TextFileSaveService(mainWindow), llmSettingsService);
+            desktop.MainWindow = mainWindow;
+        }
+
+        base.OnFrameworkInitializationCompleted();
+    }
+}

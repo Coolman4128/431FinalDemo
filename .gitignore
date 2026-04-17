@@ -1,0 +1,46 @@
+# Build output
+[Bb]in/
+[Oo]bj/
+.artifacts/
+
+# Local SDK and package caches
+.dotnet/
+.nuget/
+packages/
+
+# App runtime data
+**/AppData/
+**/ChromeProfiles/
+**/Screenshots/
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# Logs and test output
+*.log
+*.trx
+*.coverage
+*.coveragexml
+TestResults/
+
+# User- and machine-specific files
+*.user
+*.rsuser
+*.suo
+*.userosscache
+*.sln.docstates
+
+# IDE folders
+.vs/
+.vscode/
+.idea/
+
+# Rider / ReSharper
+_ReSharper*/
+*.[Rr]e[Ss]harper
+*.DotSettings.user
+
+# OS files
+Thumbs.db
+Desktop.ini
