@@ -113,6 +113,53 @@ public sealed class LlmSettingsTests
     }
 
     [Fact]
+    public void JsonAppSettingsStore_LoadAsync_CompletesWhenBlockingOnUiStyleSynchronizationContext()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "BrowserTestingTests", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        var settings = AppSettings.CreateDefault(root);
+        File.WriteAllText(
+            settings.SettingsFilePath,
+            """
+            {
+              "provider": 1,
+              "openAiModelName": "gpt-5.4",
+              "openAiApiKey": "sk-legacy-plaintext"
+            }
+            """);
+
+        var store = new JsonAppSettingsStore();
+        Exception? failure = null;
+        using var completed = new ManualResetEventSlim(false);
+        var thread = new Thread(() =>
+        {
+            SynchronizationContext.SetSynchronizationContext(new BlockingSynchronizationContext());
+            try
+            {
+                store.LoadAsync(settings, CancellationToken.None).GetAwaiter().GetResult();
+            }
+            catch (Exception ex)
+            {
+                failure = ex;
+            }
+            finally
+            {
+                completed.Set();
+            }
+        })
+        {
+            IsBackground = true,
+        };
+
+        thread.Start();
+
+        Assert.True(completed.Wait(TimeSpan.FromSeconds(2)), "Settings load blocked under a UI-style synchronization context.");
+        Assert.Null(failure);
+        Assert.Equal(LlmProvider.OpenAi, settings.Provider);
+        Assert.Equal("gpt-5.4", settings.OpenAiModelName);
+    }
+
+    [Fact]
     public async Task LmStudioLlmClient_ListModelsAsync_SortsModelsAndIncludesAuthorization()
     {
         var handler = new RecordingHttpMessageHandler(_ =>
@@ -364,6 +411,13 @@ public sealed class LlmSettingsTests
             }
 
             return clone;
+        }
+    }
+
+    private sealed class BlockingSynchronizationContext : SynchronizationContext
+    {
+        public override void Post(SendOrPostCallback d, object? state)
+        {
         }
     }
 }

@@ -1,8 +1,8 @@
+using System.Diagnostics;
 using System.Runtime.Versioning;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
-using System.Diagnostics;
 using BrowserTesting.Core.Abstractions;
 using BrowserTesting.Core.Models;
 
@@ -16,20 +16,21 @@ public sealed class JsonAppSettingsStore : IAppSettingsStore
         WriteIndented = true,
     };
 
-    public async Task LoadAsync(AppSettings settings, CancellationToken cancellationToken)
+    public Task LoadAsync(AppSettings settings, CancellationToken cancellationToken)
     {
         if (string.IsNullOrWhiteSpace(settings.SettingsFilePath) || !File.Exists(settings.SettingsFilePath))
         {
-            return;
+            return Task.CompletedTask;
         }
 
         try
         {
-            await using var stream = File.OpenRead(settings.SettingsFilePath);
-            var persisted = await JsonSerializer.DeserializeAsync<PersistedAppSettings>(stream, SerializerOptions, cancellationToken);
+            cancellationToken.ThrowIfCancellationRequested();
+            using var stream = File.OpenRead(settings.SettingsFilePath);
+            var persisted = JsonSerializer.Deserialize<PersistedAppSettings>(stream, SerializerOptions);
             if (persisted is null)
             {
-                return;
+                return Task.CompletedTask;
             }
 
             settings.Provider = Enum.IsDefined(typeof(LlmProvider), persisted.Provider)
@@ -47,8 +48,10 @@ public sealed class JsonAppSettingsStore : IAppSettingsStore
         }
         catch (Exception ex)
         {
-            Debug.WriteLine($"Failed to load app settings from '{settings.SettingsFilePath}': {ex}");
+            Trace.WriteLine($"Failed to load app settings from '{settings.SettingsFilePath}': {ex}");
         }
+
+        return Task.CompletedTask;
     }
 
     public async Task SaveAsync(AppSettings settings, CancellationToken cancellationToken)
@@ -95,7 +98,7 @@ public sealed class JsonAppSettingsStore : IAppSettingsStore
             }
             catch (Exception ex)
             {
-                Debug.WriteLine($"Failed to decrypt saved OpenAI API key: {ex}");
+                Trace.WriteLine($"Failed to decrypt saved OpenAI API key: {ex}");
 
                 if (LooksLikePlaintextApiKey(encryptedValue))
                 {
