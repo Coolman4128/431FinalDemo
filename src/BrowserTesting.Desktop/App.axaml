@@ -1,15 +1,140 @@
 <Application xmlns="https://github.com/avaloniaui"
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
              x:Class="BrowserTesting.Desktop.App">
+  <Application.Resources>
+    <SolidColorBrush x:Key="AppBackgroundBrush">#071019</SolidColorBrush>
+    <SolidColorBrush x:Key="AppPanelBrush">#0D1824</SolidColorBrush>
+    <SolidColorBrush x:Key="AppCardBrush">#122131</SolidColorBrush>
+    <SolidColorBrush x:Key="AppCardElevatedBrush">#16283B</SolidColorBrush>
+    <SolidColorBrush x:Key="AppCardSelectedBrush">#1A3550</SolidColorBrush>
+    <SolidColorBrush x:Key="AppBorderBrush">#233548</SolidColorBrush>
+    <SolidColorBrush x:Key="AppBorderStrongBrush">#2E4962</SolidColorBrush>
+    <SolidColorBrush x:Key="AppAccentBrush">#5BC0BE</SolidColorBrush>
+    <SolidColorBrush x:Key="AppTextBrush">#EAF2FB</SolidColorBrush>
+    <SolidColorBrush x:Key="AppMutedTextBrush">#90A9C2</SolidColorBrush>
+    <SolidColorBrush x:Key="AppSubtleTextBrush">#6E859B</SolidColorBrush>
+    <SolidColorBrush x:Key="AppSuccessBrush">#53C483</SolidColorBrush>
+    <SolidColorBrush x:Key="AppWarningBrush">#F2C14E</SolidColorBrush>
+    <SolidColorBrush x:Key="AppDangerBrush">#F06C7B</SolidColorBrush>
+  </Application.Resources>
   <Application.Styles>
     <FluentTheme />
+    <Style Selector="Window">
+      <Setter Property="Background" Value="{DynamicResource AppBackgroundBrush}" />
+      <Setter Property="Foreground" Value="{DynamicResource AppTextBrush}" />
+      <Setter Property="FontFamily" Value="Aptos, Segoe UI, sans-serif" />
+    </Style>
     <Style Selector="Border.card">
       <Setter Property="CornerRadius" Value="10" />
       <Setter Property="Padding" Value="12" />
       <Setter Property="Margin" Value="0,0,0,10" />
-      <Setter Property="BorderBrush" Value="#2A3B4D" />
+      <Setter Property="BorderBrush" Value="{DynamicResource AppBorderBrush}" />
       <Setter Property="BorderThickness" Value="1" />
+      <Setter Property="Background" Value="{DynamicResource AppCardBrush}" />
+    </Style>
+    <Style Selector="Border.panel">
+      <Setter Property="Background" Value="{DynamicResource AppPanelBrush}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource AppBorderBrush}" />
+      <Setter Property="BorderThickness" Value="1" />
+      <Setter Property="CornerRadius" Value="18" />
+    </Style>
+    <Style Selector="Border.sidebarItem">
+      <Setter Property="CornerRadius" Value="16" />
+      <Setter Property="Padding" Value="14" />
+      <Setter Property="BorderThickness" Value="1" />
+    </Style>
+    <Style Selector="Border.userCard">
+      <Setter Property="Background" Value="#193450" />
+      <Setter Property="BorderBrush" Value="#35597C" />
+    </Style>
+    <Style Selector="Border.assistantCard">
+      <Setter Property="Background" Value="{DynamicResource AppCardBrush}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource AppBorderBrush}" />
+    </Style>
+    <Style Selector="Border.toolCard">
+      <Setter Property="Background" Value="#13283A" />
+      <Setter Property="BorderBrush" Value="#274760" />
+    </Style>
+    <Style Selector="Border.systemCard">
       <Setter Property="Background" Value="#13202D" />
+      <Setter Property="BorderBrush" Value="{DynamicResource AppBorderBrush}" />
+    </Style>
+    <Style Selector="Border.goalCard">
+      <Setter Property="Background" Value="#142B22" />
+      <Setter Property="BorderBrush" Value="#274939" />
+    </Style>
+    <Style Selector="Border.emptyStateCard">
+      <Setter Property="Background" Value="#0F1D2B" />
+      <Setter Property="BorderBrush" Value="#2B4258" />
+      <Setter Property="CornerRadius" Value="24" />
+      <Setter Property="Padding" Value="28" />
+    </Style>
+    <Style Selector="Button.toolbar">
+      <Setter Property="Background" Value="#183049" />
+      <Setter Property="BorderBrush" Value="#31506A" />
+      <Setter Property="BorderThickness" Value="1" />
+      <Setter Property="CornerRadius" Value="999" />
+      <Setter Property="Padding" Value="16,9" />
+      <Setter Property="FontWeight" Value="SemiBold" />
+      <Setter Property="MinHeight" Value="38" />
+    </Style>
+    <Style Selector="Button.primaryAction">
+      <Setter Property="Background" Value="{DynamicResource AppAccentBrush}" />
+      <Setter Property="Foreground" Value="#062028" />
+      <Setter Property="BorderBrush" Value="#78D8D5" />
+      <Setter Property="BorderThickness" Value="1" />
+      <Setter Property="CornerRadius" Value="16" />
+      <Setter Property="Padding" Value="18,12" />
+      <Setter Property="FontWeight" Value="Bold" />
+      <Setter Property="MinHeight" Value="46" />
+    </Style>
+    <Style Selector="Button.iconButton">
+      <Setter Property="Background" Value="#132435" />
+      <Setter Property="BorderBrush" Value="{DynamicResource AppBorderStrongBrush}" />
+      <Setter Property="BorderThickness" Value="1" />
+      <Setter Property="CornerRadius" Value="14" />
+      <Setter Property="Padding" Value="10" />
+      <Setter Property="MinWidth" Value="42" />
+      <Setter Property="MinHeight" Value="42" />
+    </Style>
+    <Style Selector="TextBox.composer">
+      <Setter Property="Background" Value="#0E1A27" />
+      <Setter Property="BorderBrush" Value="{DynamicResource AppBorderStrongBrush}" />
+      <Setter Property="BorderThickness" Value="1" />
+      <Setter Property="CornerRadius" Value="16" />
+      <Setter Property="Padding" Value="14,12" />
+      <Setter Property="FontSize" Value="14" />
+      <Setter Property="MinHeight" Value="48" />
+    </Style>
+    <Style Selector="ToggleSwitch.toolbarToggle">
+      <Setter Property="OnContent" Value="" />
+      <Setter Property="OffContent" Value="" />
+    </Style>
+    <Style Selector="ProgressBar.toolSpinner">
+      <Setter Property="Height" Value="4" />
+      <Setter Property="Foreground" Value="{DynamicResource AppAccentBrush}" />
+      <Setter Property="Background" Value="#1D3246" />
+      <Setter Property="CornerRadius" Value="999" />
+    </Style>
+    <Style Selector="TextBlock.sectionLabel">
+      <Setter Property="Foreground" Value="{DynamicResource AppMutedTextBrush}" />
+      <Setter Property="FontSize" Value="12" />
+      <Setter Property="FontWeight" Value="SemiBold" />
+      <Setter Property="LetterSpacing" Value="0.8" />
+    </Style>
+    <Style Selector="TextBlock.caption">
+      <Setter Property="Foreground" Value="{DynamicResource AppMutedTextBrush}" />
+      <Setter Property="FontSize" Value="12" />
+    </Style>
+    <Style Selector="ListBox.chatList">
+      <Setter Property="Background" Value="Transparent" />
+      <Setter Property="BorderThickness" Value="0" />
+    </Style>
+    <Style Selector="ListBox.chatList > ListBoxItem">
+      <Setter Property="Background" Value="Transparent" />
+      <Setter Property="BorderThickness" Value="0" />
+      <Setter Property="Padding" Value="0" />
+      <Setter Property="Margin" Value="0,0,0,10" />
     </Style>
   </Application.Styles>
 </Application>

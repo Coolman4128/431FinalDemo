@@ -38,14 +38,12 @@ public sealed class ChatOrchestrator(
             return null;
         }
 
-        await repository.SaveBrowserSnapshotAsync(runId, snapshot, cancellationToken);
         onUpdate?.Invoke(new BrowserSnapshotUpdated(runId, snapshot));
         return snapshot;
     }
 
     public async Task<ChatSession?> LoadChatAsync(
         Guid chatId,
-        bool restoreBrowser,
         Action<OrchestratorUpdate>? onUpdate,
         CancellationToken cancellationToken)
     {
@@ -55,40 +53,39 @@ public sealed class ChatOrchestrator(
             return null;
         }
 
-        if (restoreBrowser)
+        if (onUpdate is not null)
         {
             var run = chat.Runs
                 .OrderByDescending(candidate => candidate.UpdatedAtUtc)
-                .FirstOrDefault(candidate =>
-                    candidate.BrowserSnapshot.CurrentUrl is not null ||
-                    !string.IsNullOrWhiteSpace(candidate.BrowserSnapshot.ProfilePath));
+                .FirstOrDefault();
 
-            if (run is not null)
+            if (run is not null && RequiresResumeNormalization(run.BrowserSnapshot))
             {
-                try
-                {
-                    var restored = await browserSessionManager.RestoreBrowserAsync(
-                        run.Id,
-                        run.BrowserSnapshot,
-                        settings.LaunchHeadless,
-                        cancellationToken);
-
-                    run.BrowserSnapshot = restored;
-                    await repository.SaveBrowserSnapshotAsync(run.Id, restored, cancellationToken);
-                    onUpdate?.Invoke(new BrowserSnapshotUpdated(run.Id, restored));
-                }
-                catch (Exception ex)
-                {
-                    run.BrowserSnapshot.RestoreStatus = RestoreStatus.Failed;
-                    run.BrowserSnapshot.LastCapturedAtUtc = DateTime.UtcNow;
-                    await repository.SaveBrowserSnapshotAsync(run.Id, run.BrowserSnapshot, cancellationToken);
-                    onUpdate?.Invoke(new OrchestrationError($"Browser restore failed for run {run.Id}: {ex.Message}"));
-                }
+                run.BrowserSnapshot = CloseSnapshot(run.BrowserSnapshot);
+                await repository.SaveBrowserSnapshotAsync(run.Id, run.BrowserSnapshot, cancellationToken);
             }
         }
 
         onUpdate?.Invoke(new ChatLoaded(chat));
         return chat;
+    }
+
+    public async Task<BrowserSessionSnapshot?> CloseBrowserAsync(
+        Guid runId,
+        Action<OrchestratorUpdate>? onUpdate,
+        CancellationToken cancellationToken)
+    {
+        await browserSessionManager.CloseBrowserAsync(runId, cancellationToken);
+
+        var snapshot = await browserSessionManager.GetSnapshotAsync(runId, cancellationToken);
+        if (snapshot is null)
+        {
+            return null;
+        }
+
+        await repository.SaveBrowserSnapshotAsync(runId, snapshot, cancellationToken);
+        onUpdate?.Invoke(new BrowserSnapshotUpdated(runId, snapshot));
+        return snapshot;
     }
 
     public async Task<TestRun> RunPromptAsync(Guid chatId, string prompt, Action<OrchestratorUpdate> onUpdate, CancellationToken cancellationToken)
@@ -1091,6 +1088,30 @@ public sealed class ChatOrchestrator(
 
         return true;
     }
+
+    private static bool RequiresResumeNormalization(BrowserSessionSnapshot snapshot) =>
+        snapshot.RestoreStatus is not (RestoreStatus.NotStarted or RestoreStatus.Closed)
+        || !string.IsNullOrWhiteSpace(snapshot.CurrentUrl)
+        || !string.IsNullOrWhiteSpace(snapshot.PageTitle)
+        || !string.IsNullOrWhiteSpace(snapshot.DriverSessionId)
+        || !string.IsNullOrWhiteSpace(snapshot.DriverServiceUrl)
+        || snapshot.BrowserProcessId is not null
+        || snapshot.Tabs.Count > 0;
+
+    private static BrowserSessionSnapshot CloseSnapshot(BrowserSessionSnapshot snapshot) =>
+        new()
+        {
+            TestRunId = snapshot.TestRunId,
+            ProfilePath = snapshot.ProfilePath,
+            CurrentUrl = null,
+            PageTitle = null,
+            DriverSessionId = null,
+            DriverServiceUrl = null,
+            BrowserProcessId = null,
+            RestoreStatus = RestoreStatus.Closed,
+            LastCapturedAtUtc = DateTime.UtcNow,
+            Tabs = [],
+        };
 
     private static bool TryInferNoArgumentToolCall(
         string content,

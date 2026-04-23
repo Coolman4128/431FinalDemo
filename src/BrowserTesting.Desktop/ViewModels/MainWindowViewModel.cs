@@ -1,5 +1,4 @@
 using System.Collections.ObjectModel;
-using System.Linq;
 using BrowserTesting.Core.Abstractions;
 using BrowserTesting.Core.Models;
 using BrowserTesting.Core.Orchestration;
@@ -13,7 +12,9 @@ public sealed class MainWindowViewModel : ObservableObject
 {
     private readonly IChatOrchestrator orchestrator;
     private readonly ITextFileSaveService textFileSaveService;
-    private readonly DispatcherTimer browserStatusTimer;
+    private readonly ILlmSettingsService llmSettingsService;
+    private readonly Action<Action> uiDispatcher;
+    private readonly ChatListItemViewModel draftChatItem = ChatListItemViewModel.CreateDraft();
     private ChatListItemViewModel? selectedChat;
     private ChatSession? currentChat;
     private string composerText = string.Empty;
@@ -21,11 +22,11 @@ public sealed class MainWindowViewModel : ObservableObject
     private string browserUrl = "n/a";
     private string browserTitle = "n/a";
     private string restoreStatus = "Not started";
-    private string selectedRunTitle = "No run selected";
+    private string selectedRunTitle = "Draft conversation";
     private string statusText = "Ready";
+    private string providerModelStatusText = string.Empty;
     private Guid? selectedChatId;
     private Guid? selectedRunId;
-    private int browserStatusRefreshInProgress;
     private Guid? loadingChatId;
     private bool suppressSelectedChatLoad;
     private bool isSelectionModeEnabled;
@@ -34,33 +35,40 @@ public sealed class MainWindowViewModel : ObservableObject
     public MainWindowViewModel(
         IChatOrchestrator orchestrator,
         ITextFileSaveService textFileSaveService,
-        ILlmSettingsService llmSettingsService)
+        ILlmSettingsService llmSettingsService,
+        Action<Action>? uiDispatcher = null)
     {
         this.orchestrator = orchestrator;
         this.textFileSaveService = textFileSaveService;
+        this.llmSettingsService = llmSettingsService;
+        this.uiDispatcher = uiDispatcher ?? DispatchToUiThread;
+
         Settings = new LlmSettingsViewModel(llmSettingsService);
         Settings.PropertyChanged += (_, args) =>
         {
             if (args.PropertyName is nameof(LlmSettingsViewModel.IsOpen))
             {
                 RaisePropertyChanged(nameof(IsTimelineVisible));
+                RaisePropertyChanged(nameof(IsDraftWorkspaceVisible));
                 RaisePropertyChanged(nameof(IsSelectionTranscriptVisible));
                 RaisePropertyChanged(nameof(IsComposerVisible));
             }
         };
-        Settings.Completed += message => Dispatcher.UIThread.Post(() => StatusText = message);
-        NewChatCommand = new AsyncRelayCommand(CreateNewChatAsync);
-        SendCommand = new AsyncRelayCommand(SendAsync, () => !string.IsNullOrWhiteSpace(ComposerText));
-        ExportChatCommand = new AsyncRelayCommand(ExportChatAsync, () => SelectedChat is not null);
-        browserStatusTimer = new DispatcherTimer
+        Settings.Completed += message => this.uiDispatcher(() =>
         {
-            Interval = TimeSpan.FromSeconds(1),
-        };
-        browserStatusTimer.Tick += async (_, _) => await RefreshSelectedRunBrowserAsync();
-        browserStatusTimer.Start();
-        _ = InitializeAsync();
+            StatusText = message;
+            RefreshProviderModelStatusText();
+        });
+
+        NewChatCommand = new AsyncRelayCommand(SelectDraftChatAsync);
+        SendCommand = new AsyncRelayCommand(SendAsync, () => !string.IsNullOrWhiteSpace(ComposerText));
+        ExportChatCommand = new AsyncRelayCommand(ExportChatAsync, () => CanExportSelectedChat());
+
+        RefreshProviderModelStatusText();
+        InitializationTask = InitializeAsync();
     }
 
+    public Task InitializationTask { get; }
     public ObservableCollection<ChatListItemViewModel> Chats { get; } = [];
     public ObservableCollection<TimelineItemViewModel> Timeline { get; } = [];
     public ObservableCollection<GoalItemViewModel> Goals { get; } = [];
@@ -74,14 +82,29 @@ public sealed class MainWindowViewModel : ObservableObject
         get => selectedChat;
         set
         {
-            if (SetProperty(ref selectedChat, value))
+            if (!SetProperty(ref selectedChat, value))
             {
-                ExportChatCommand.RaiseCanExecuteChanged();
-                if (!suppressSelectedChatLoad)
-                {
-                    _ = LoadChatAsync(value?.Id);
-                }
+                return;
             }
+
+            UpdateChatSelectionState();
+            ExportChatCommand.RaiseCanExecuteChanged();
+            RaisePropertyChanged(nameof(IsDraftSelected));
+            RaisePropertyChanged(nameof(IsTimelineVisible));
+            RaisePropertyChanged(nameof(IsDraftWorkspaceVisible));
+
+            if (suppressSelectedChatLoad)
+            {
+                return;
+            }
+
+            if (value is null || value.IsDraft || value.Id is null)
+            {
+                _ = TransitionToDraftWorkspaceAsync();
+                return;
+            }
+
+            _ = SwitchToChatAsync(value.Id.Value);
         }
     }
 
@@ -103,11 +126,14 @@ public sealed class MainWindowViewModel : ObservableObject
     public string RestoreStatus { get => restoreStatus; set => SetProperty(ref restoreStatus, value); }
     public string SelectedRunTitle { get => selectedRunTitle; set => SetProperty(ref selectedRunTitle, value); }
     public string StatusText { get => statusText; set => SetProperty(ref statusText, value); }
+    public string ProviderModelStatusText { get => providerModelStatusText; private set => SetProperty(ref providerModelStatusText, value); }
     public string SelectionTranscriptText { get => selectionTranscriptText; set => SetProperty(ref selectionTranscriptText, value); }
-    public bool IsBubbleViewEnabled => !IsSelectionModeEnabled;
-    public bool IsTimelineVisible => !Settings.IsOpen && IsBubbleViewEnabled;
+    public bool IsDraftSelected => SelectedChat?.IsDraft ?? true;
+    public bool IsTimelineVisible => !Settings.IsOpen && !IsSelectionModeEnabled && !IsDraftSelected;
+    public bool IsDraftWorkspaceVisible => !Settings.IsOpen && !IsSelectionModeEnabled && IsDraftSelected;
     public bool IsSelectionTranscriptVisible => !Settings.IsOpen && IsSelectionModeEnabled;
     public bool IsComposerVisible => !Settings.IsOpen;
+
     public bool IsSelectionModeEnabled
     {
         get => isSelectionModeEnabled;
@@ -115,8 +141,8 @@ public sealed class MainWindowViewModel : ObservableObject
         {
             if (SetProperty(ref isSelectionModeEnabled, value))
             {
-                RaisePropertyChanged(nameof(IsBubbleViewEnabled));
                 RaisePropertyChanged(nameof(IsTimelineVisible));
+                RaisePropertyChanged(nameof(IsDraftWorkspaceVisible));
                 RaisePropertyChanged(nameof(IsSelectionTranscriptVisible));
             }
         }
@@ -127,35 +153,26 @@ public sealed class MainWindowViewModel : ObservableObject
         await orchestrator.InitializeAsync(CancellationToken.None);
         var chats = await orchestrator.ListChatsAsync(CancellationToken.None);
         ReplaceChats(chats);
-        if (Chats.Count == 0)
-        {
-            await CreateNewChatAsync();
-        }
-        else
-        {
-            SelectedChat = Chats[0];
-        }
+        SelectChatWithoutLoading(draftChatItem);
+        ResetDraftWorkspace("Ready");
     }
 
-    private async Task CreateNewChatAsync()
+    private Task SelectDraftChatAsync()
+    {
+        SelectChatWithoutLoading(draftChatItem);
+        return TransitionToDraftWorkspaceAsync();
+    }
+
+    private async Task<ChatSession> CreatePersistedChatAsync()
     {
         var chat = await orchestrator.CreateChatAsync("New Chat", CancellationToken.None);
-        var item = new ChatListItemViewModel
-        {
-            Id = chat.Id,
-            Title = chat.Title,
-            UpdatedAtUtc = chat.UpdatedAtUtc,
-            ActiveRuns = 0,
-        };
-
-        Chats.Insert(0, item);
-        SelectedChat = item;
-        StatusText = "New chat created.";
+        ApplyChat(chat, "New chat created.");
+        return chat;
     }
 
-    private async Task LoadChatAsync(Guid? chatId)
+    private async Task LoadChatAsync(Guid chatId)
     {
-        if (chatId is null || loadingChatId == chatId)
+        if (loadingChatId == chatId)
         {
             return;
         }
@@ -163,9 +180,14 @@ public sealed class MainWindowViewModel : ObservableObject
         loadingChatId = chatId;
         selectedChatId = chatId;
         StatusText = "Loading chat...";
+
         try
         {
-            await orchestrator.LoadChatAsync(chatId.Value, restoreBrowser: true, ApplyUpdate, CancellationToken.None);
+            var chat = await orchestrator.LoadChatAsync(chatId, ApplyUpdate, CancellationToken.None);
+            if (chat is null && selectedChatId == chatId)
+            {
+                ResetDraftWorkspace("Unable to load the selected chat.");
+            }
         }
         finally
         {
@@ -176,19 +198,46 @@ public sealed class MainWindowViewModel : ObservableObject
         }
     }
 
-    private async Task SendAsync()
+    private async Task SwitchToChatAsync(Guid chatId)
     {
-        if (selectedChatId is null)
+        var previousRunId = selectedRunId;
+        if (previousRunId is not null)
         {
-            await CreateNewChatAsync();
+            await orchestrator.CloseBrowserAsync(previousRunId.Value, ApplyUpdate, CancellationToken.None);
         }
 
-        if (selectedChatId is null || string.IsNullOrWhiteSpace(ComposerText))
+        await LoadChatAsync(chatId);
+    }
+
+    private async Task TransitionToDraftWorkspaceAsync()
+    {
+        var previousRunId = selectedRunId;
+        if (previousRunId is not null)
+        {
+            await orchestrator.CloseBrowserAsync(previousRunId.Value, ApplyUpdate, CancellationToken.None);
+        }
+
+        ResetDraftWorkspace("New chat draft ready.");
+    }
+
+    private async Task SendAsync()
+    {
+        var prompt = ComposerText.Trim();
+        if (string.IsNullOrWhiteSpace(prompt))
         {
             return;
         }
 
-        var prompt = ComposerText.Trim();
+        if (selectedChatId is null || SelectedChat?.IsDraft != false)
+        {
+            await CreatePersistedChatAsync();
+        }
+
+        if (selectedChatId is null)
+        {
+            return;
+        }
+
         ComposerText = string.Empty;
         StatusText = "Running test...";
         await orchestrator.RunPromptAsync(selectedChatId.Value, prompt, ApplyUpdate, CancellationToken.None);
@@ -197,14 +246,14 @@ public sealed class MainWindowViewModel : ObservableObject
 
     private async Task ExportChatAsync()
     {
-        if (SelectedChat is null)
+        if (SelectedChat?.Id is not Guid chatId)
         {
             return;
         }
 
         try
         {
-            var chat = await orchestrator.LoadChatAsync(SelectedChat.Id, restoreBrowser: false, onUpdate: null, CancellationToken.None);
+            var chat = await orchestrator.LoadChatAsync(chatId, onUpdate: null, CancellationToken.None);
             if (chat is null)
             {
                 StatusText = "Unable to load the selected chat for export.";
@@ -228,51 +277,51 @@ public sealed class MainWindowViewModel : ObservableObject
         }
     }
 
-    private void ApplyUpdate(OrchestratorUpdate update)
-    {
-        Dispatcher.UIThread.Post(() =>
+    private void ApplyUpdate(OrchestratorUpdate update) =>
+        uiDispatcher(() =>
         {
             switch (update)
             {
-                case ChatLoaded loaded:
-                    ApplyChat(loaded.Chat);
+                case ChatLoaded loaded when selectedChatId == loaded.Chat.Id:
+                    ApplyChat(loaded.Chat, "Chat loaded.");
                     break;
+
                 case TimelineEntryUpserted timelineUpdate:
                     UpsertTimeline(timelineUpdate.Entry);
                     break;
+
                 case BrowserSnapshotUpdated browserUpdate:
                     if (selectedRunId == browserUpdate.RunId)
                     {
                         ApplyBrowserSnapshot(browserUpdate.Snapshot);
                     }
                     break;
+
                 case GoalsUpdated goalsUpdate:
                     if (selectedRunId == goalsUpdate.RunId)
                     {
                         ApplyGoals(goalsUpdate.Goals);
                     }
                     break;
+
                 case RunUpdated runUpdate:
                     ApplyRun(runUpdate.Run);
                     break;
+
                 case OrchestrationError error:
                     StatusText = error.Message;
                     break;
             }
         });
-    }
 
-    private void ApplyChat(ChatSession chat)
+    private void ApplyChat(ChatSession chat, string statusMessage)
     {
         currentChat = chat;
         selectedChatId = chat.Id;
-        UpsertChatSummary(chat);
 
-        Timeline.Clear();
-        foreach (var entry in chat.Timeline.OrderBy(item => item.Sequence))
-        {
-            Timeline.Add(CreateTimelineViewModel(entry));
-        }
+        var savedChat = UpsertChatSummary(chat);
+        SelectChatWithoutLoading(savedChat);
+        RebuildTimeline();
 
         var run = chat.Runs
             .OrderByDescending(candidate => candidate.UpdatedAtUtc)
@@ -288,15 +337,12 @@ public sealed class MainWindowViewModel : ObservableObject
         {
             selectedRunId = null;
             Goals.Clear();
+            ResetBrowserSummary();
             SelectedRunTitle = "No run selected";
-            BrowserStatus = "No browser";
-            BrowserUrl = "n/a";
-            BrowserTitle = "n/a";
-            RestoreStatus = "Not started";
         }
 
         RefreshSelectionTranscript();
-        StatusText = "Chat loaded.";
+        StatusText = statusMessage;
     }
 
     private void ApplyRun(TestRun run)
@@ -339,30 +385,12 @@ public sealed class MainWindowViewModel : ObservableObject
         RestoreStatus = snapshot.RestoreStatus.ToString();
     }
 
-    private async Task RefreshSelectedRunBrowserAsync()
-    {
-        if (selectedRunId is null || Interlocked.Exchange(ref browserStatusRefreshInProgress, 1) == 1)
-        {
-            return;
-        }
-
-        try
-        {
-            await orchestrator.RefreshBrowserSnapshotAsync(selectedRunId.Value, ApplyUpdate, CancellationToken.None);
-        }
-        catch
-        {
-        }
-        finally
-        {
-            Interlocked.Exchange(ref browserStatusRefreshInProgress, 0);
-        }
-    }
-
     private void ReplaceChats(IReadOnlyList<ChatSessionSummary> chats)
     {
         Chats.Clear();
-        foreach (var chat in chats)
+        Chats.Add(draftChatItem);
+
+        foreach (var chat in chats.OrderByDescending(item => item.UpdatedAtUtc))
         {
             Chats.Add(new ChatListItemViewModel
             {
@@ -372,122 +400,225 @@ public sealed class MainWindowViewModel : ObservableObject
                 ActiveRuns = chat.ActiveRuns,
             });
         }
+
+        UpdateChatSelectionState();
     }
 
-    private void UpsertChatSummary(ChatSession chat)
+    private ChatListItemViewModel UpsertChatSummary(ChatSession chat)
     {
-        if (currentChat?.Id == chat.Id)
-        {
-            currentChat.Title = chat.Title;
-            currentChat.UpdatedAtUtc = chat.UpdatedAtUtc;
-            RefreshSelectionTranscript();
-        }
-
-        var current = Chats.FirstOrDefault(item => item.Id == chat.Id);
         var activeRuns = chat.Runs.Count(run => run.Status is TestRunStatus.Pending or TestRunStatus.Running or TestRunStatus.WaitingForTool);
+        var current = Chats.FirstOrDefault(item => !item.IsDraft && item.Id == chat.Id);
 
         if (current is null)
         {
-            Chats.Insert(0, new ChatListItemViewModel
+            current = new ChatListItemViewModel
             {
                 Id = chat.Id,
                 Title = chat.Title,
                 UpdatedAtUtc = chat.UpdatedAtUtc,
                 ActiveRuns = activeRuns,
-            });
+            };
+            InsertSavedChatItemSorted(current);
         }
         else
         {
             current.Title = chat.Title;
             current.UpdatedAtUtc = chat.UpdatedAtUtc;
             current.ActiveRuns = activeRuns;
-
-            if (selectedChat?.Id == current.Id && !ReferenceEquals(selectedChat, current))
-            {
-                suppressSelectedChatLoad = true;
-                try
-                {
-                    SelectedChat = current;
-                }
-                finally
-                {
-                    suppressSelectedChatLoad = false;
-                }
-            }
         }
+
+        UpdateChatSelectionState();
+        return current;
+    }
+
+    private void InsertSavedChatItemSorted(ChatListItemViewModel item)
+    {
+        var insertIndex = GetSortedInsertIndex(item);
+        Chats.Insert(insertIndex, item);
+    }
+
+    private int GetSortedInsertIndex(ChatListItemViewModel item)
+    {
+        var insertIndex = 1;
+        while (insertIndex < Chats.Count)
+        {
+            var candidate = Chats[insertIndex];
+            if (ReferenceEquals(candidate, item))
+            {
+                insertIndex++;
+                continue;
+            }
+
+            if (candidate.UpdatedAtUtc <= item.UpdatedAtUtc)
+            {
+                break;
+            }
+
+            insertIndex++;
+        }
+
+        return insertIndex;
     }
 
     private void UpsertTimeline(TimelineEntry entry)
     {
-        if (currentChat?.Id == entry.ChatSessionId)
+        if (currentChat?.Id != entry.ChatSessionId)
         {
-            var currentEntry = currentChat.Timeline.FirstOrDefault(item => item.Id == entry.Id);
-            if (currentEntry is null)
-            {
-                currentChat.Timeline.Add(entry);
-            }
-            else
-            {
-                currentEntry.Sequence = entry.Sequence;
-                currentEntry.Kind = entry.Kind;
-                currentEntry.Role = entry.Role;
-                currentEntry.Content = entry.Content;
-                currentEntry.ToolCallId = entry.ToolCallId;
-                currentEntry.ToolName = entry.ToolName;
-                currentEntry.MetadataJson = entry.MetadataJson;
-                currentEntry.CreatedAtUtc = entry.CreatedAtUtc;
-                currentEntry.TestRunId = entry.TestRunId;
-            }
-
-            currentChat.UpdatedAtUtc = DateTime.UtcNow;
-            RefreshSelectionTranscript();
-        }
-
-        var existing = Timeline.FirstOrDefault(item => item.EntryId == entry.Id);
-        if (existing is null)
-        {
-            Timeline.Add(CreateTimelineViewModel(entry));
             return;
         }
 
-        switch (existing)
+        var currentEntry = currentChat.Timeline.FirstOrDefault(item => item.Id == entry.Id);
+        if (currentEntry is null)
         {
-            case UserTimelineItemViewModel user:
-                user.Content = entry.Content;
-                break;
-            case AssistantTimelineItemViewModel assistant:
-                assistant.Content = entry.Content;
-                break;
-            case ToolStartedTimelineItemViewModel started:
-                started.Summary = entry.Content;
-                break;
-            case ToolFinishedTimelineItemViewModel finished:
-                finished.Summary = entry.Content;
-                break;
-            case GoalChangedTimelineItemViewModel goal:
-                goal.Content = entry.Content;
-                break;
-            case SystemTimelineItemViewModel system:
-                system.Content = entry.Content;
-                break;
+            currentChat.Timeline.Add(entry);
         }
+        else
+        {
+            currentEntry.Sequence = entry.Sequence;
+            currentEntry.Kind = entry.Kind;
+            currentEntry.Role = entry.Role;
+            currentEntry.Content = entry.Content;
+            currentEntry.ToolCallId = entry.ToolCallId;
+            currentEntry.ToolName = entry.ToolName;
+            currentEntry.MetadataJson = entry.MetadataJson;
+            currentEntry.CreatedAtUtc = entry.CreatedAtUtc;
+            currentEntry.TestRunId = entry.TestRunId;
+        }
+
+        currentChat.UpdatedAtUtc = DateTime.UtcNow;
+        UpsertChatSummary(currentChat);
+        RefreshSelectionTranscript();
+        RebuildTimeline();
     }
 
-    private static TimelineItemViewModel CreateTimelineViewModel(TimelineEntry entry) =>
-        entry.Kind switch
+    private void RebuildTimeline()
+    {
+        Timeline.Clear();
+        if (currentChat is null)
         {
-            TimelineItemKind.UserMessage => new UserTimelineItemViewModel(entry),
-            TimelineItemKind.AssistantMessage => new AssistantTimelineItemViewModel(entry),
-            TimelineItemKind.ToolCallStarted => new ToolStartedTimelineItemViewModel(entry),
-            TimelineItemKind.ToolCallFinished => new ToolFinishedTimelineItemViewModel(entry),
-            TimelineItemKind.GoalChanged => new GoalChangedTimelineItemViewModel(entry),
-            _ => new SystemTimelineItemViewModel(entry),
-        };
+            return;
+        }
+
+        var toolItemsByCallId = new Dictionary<string, ToolTimelineItemViewModel>(StringComparer.Ordinal);
+
+        foreach (var entry in currentChat.Timeline.OrderBy(item => item.Sequence))
+        {
+            switch (entry.Kind)
+            {
+                case TimelineItemKind.UserMessage:
+                    Timeline.Add(new UserTimelineItemViewModel(entry));
+                    break;
+
+                case TimelineItemKind.AssistantMessage:
+                    Timeline.Add(new AssistantTimelineItemViewModel(entry));
+                    break;
+
+                case TimelineItemKind.ToolCallStarted:
+                {
+                    var toolItem = new ToolTimelineItemViewModel(entry);
+                    toolItemsByCallId[toolItem.ItemKey] = toolItem;
+                    Timeline.Add(toolItem);
+                    break;
+                }
+
+                case TimelineItemKind.ToolCallFinished:
+                {
+                    var itemKey = entry.ToolCallId ?? entry.Id.ToString("N");
+                    if (toolItemsByCallId.TryGetValue(itemKey, out var existing))
+                    {
+                        existing.ApplyFinishedEntry(entry);
+                    }
+                    else
+                    {
+                        var toolItem = new ToolTimelineItemViewModel(entry);
+                        toolItem.ApplyFinishedEntry(entry);
+                        toolItemsByCallId[toolItem.ItemKey] = toolItem;
+                        Timeline.Add(toolItem);
+                    }
+
+                    break;
+                }
+
+                case TimelineItemKind.GoalChanged:
+                    Timeline.Add(new GoalChangedTimelineItemViewModel(entry));
+                    break;
+
+                default:
+                    Timeline.Add(new SystemTimelineItemViewModel(entry));
+                    break;
+            }
+        }
+    }
 
     private void RefreshSelectionTranscript() =>
         SelectionTranscriptText = currentChat is null
             ? string.Empty
             : ChatTranscriptFormatter.FormatForSelection(currentChat);
+
+    private void SelectChatWithoutLoading(ChatListItemViewModel chatItem)
+    {
+        suppressSelectedChatLoad = true;
+        try
+        {
+            SelectedChat = chatItem;
+        }
+        finally
+        {
+            suppressSelectedChatLoad = false;
+        }
+    }
+
+    private void UpdateChatSelectionState()
+    {
+        foreach (var chat in Chats)
+        {
+            chat.IsSelected = ReferenceEquals(chat, SelectedChat);
+        }
+    }
+
+    private void ResetDraftWorkspace(string statusMessage)
+    {
+        currentChat = null;
+        selectedChatId = null;
+        selectedRunId = null;
+        loadingChatId = null;
+        ComposerText = string.Empty;
+        Timeline.Clear();
+        Goals.Clear();
+        SelectedRunTitle = "Draft conversation";
+        ResetBrowserSummary();
+        SelectionTranscriptText = string.Empty;
+        StatusText = statusMessage;
+    }
+
+    private void ResetBrowserSummary()
+    {
+        BrowserStatus = "No browser";
+        BrowserUrl = "n/a";
+        BrowserTitle = "n/a";
+        RestoreStatus = "Not started";
+    }
+
+    private bool CanExportSelectedChat() => SelectedChat?.Id is not null && !SelectedChat.IsDraft;
+
+    private void RefreshProviderModelStatusText()
+    {
+        var settings = llmSettingsService.Settings;
+        var providerLabel = settings.Provider == LlmProvider.OpenAi ? "OpenAI" : "Local";
+        var modelName = string.IsNullOrWhiteSpace(settings.CurrentModelName) ? "No model selected" : settings.CurrentModelName;
+        ProviderModelStatusText = $"{providerLabel} | {modelName}";
+    }
+
+    private static void DispatchToUiThread(Action action)
+    {
+        if (Dispatcher.UIThread.CheckAccess())
+        {
+            action();
+            return;
+        }
+
+        Dispatcher.UIThread.Post(action);
+    }
 
     private static string BuildExportFileName(ChatSession chat)
     {

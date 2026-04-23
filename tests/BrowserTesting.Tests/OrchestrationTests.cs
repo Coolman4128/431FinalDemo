@@ -840,7 +840,7 @@ public sealed class OrchestrationTests
     }
 
     [Fact]
-    public async Task LoadChatAsync_RestoresOnlyMostRecentRestorableRun()
+    public async Task LoadChatAsync_NormalizesMostRecentRunSnapshotToClosed()
     {
         var repository = new InMemoryRepository();
         var browserManager = new FakeBrowserManager();
@@ -874,10 +874,90 @@ public sealed class OrchestrationTests
         await repository.UpdateRunAsync(firstRun, CancellationToken.None);
         await repository.UpdateRunAsync(secondRun, CancellationToken.None);
 
-        await orchestrator.LoadChatAsync(chat.Id, restoreBrowser: true, onUpdate: null, CancellationToken.None);
+        var loaded = await orchestrator.LoadChatAsync(chat.Id, _ => { }, CancellationToken.None);
 
-        Assert.Single(browserManager.RestoreRequests);
-        Assert.Equal(secondRun.Id, browserManager.RestoreRequests[0]);
+        Assert.NotNull(loaded);
+        var latestRun = Assert.Single(loaded!.Runs, run => run.Id == secondRun.Id);
+        Assert.Equal(RestoreStatus.Closed, latestRun.BrowserSnapshot.RestoreStatus);
+        Assert.Null(latestRun.BrowserSnapshot.CurrentUrl);
+        Assert.Null(latestRun.BrowserSnapshot.DriverSessionId);
+
+        var reloaded = await repository.GetChatAsync(chat.Id, CancellationToken.None);
+        var persistedLatestRun = Assert.Single(reloaded!.Runs, run => run.Id == secondRun.Id);
+        Assert.Equal(RestoreStatus.Closed, persistedLatestRun.BrowserSnapshot.RestoreStatus);
+        Assert.Null(persistedLatestRun.BrowserSnapshot.CurrentUrl);
+    }
+
+    [Fact]
+    public async Task RunPromptAsync_AfterLoadingChat_UsesClosedBrowserSnapshotInSystemPrompt()
+    {
+        var repository = new InMemoryRepository();
+        var browserManager = new FakeBrowserManager();
+        var goalService = new GoalService(repository);
+        var secretStore = new FakeSecretStore();
+        var toolExecutor = new ToolExecutor(browserManager, goalService, repository, secretStore, new ToolRegistry());
+        var llmClient = new FakeLlmClient(
+            [
+                new LlmTextDelta("Continuing the run without a restored browser."),
+                new LlmStreamCompleted("stop"),
+            ]);
+
+        var orchestrator = new ChatOrchestrator(
+            repository,
+            llmClient,
+            new ToolRegistry(),
+            toolExecutor,
+            browserManager,
+            secretStore,
+            AppSettings.CreateDefault(Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString("N"))));
+
+        await orchestrator.InitializeAsync(CancellationToken.None);
+        var chat = await repository.CreateChatAsync("Resume", CancellationToken.None);
+        var priorRun = await repository.CreateRunAsync(chat.Id, "Original prompt", CancellationToken.None);
+        priorRun.BrowserSnapshot = new BrowserSessionSnapshot
+        {
+            TestRunId = priorRun.Id,
+            CurrentUrl = "https://example.com/dashboard",
+            PageTitle = "Dashboard",
+            DriverSessionId = "session-123",
+            RestoreStatus = RestoreStatus.Active,
+        };
+        await repository.UpdateRunAsync(priorRun, CancellationToken.None);
+
+        await orchestrator.LoadChatAsync(chat.Id, _ => { }, CancellationToken.None);
+        await orchestrator.RunPromptAsync(chat.Id, "Continue testing", _ => { }, CancellationToken.None);
+
+        var systemPrompt = llmClient.Requests[0].Messages[0].Content;
+        Assert.NotNull(systemPrompt);
+        Assert.Contains("\"CurrentUrl\":null", systemPrompt, StringComparison.Ordinal);
+        Assert.DoesNotContain("https://example.com/dashboard", systemPrompt, StringComparison.Ordinal);
+        Assert.DoesNotContain("session-123", systemPrompt, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task CloseBrowserAsync_PersistsClosedSnapshotForRun()
+    {
+        var repository = new InMemoryRepository();
+        var browserManager = new FakeBrowserManager();
+        var secretStore = new FakeSecretStore();
+        var orchestrator = new ChatOrchestrator(
+            repository,
+            new FakeLlmClient(Array.Empty<LlmStreamEvent>()),
+            new FixedToolRegistry(),
+            new FakeToolExecutor(),
+            browserManager,
+            secretStore,
+            AppSettings.CreateDefault(Path.GetTempPath()));
+
+        await orchestrator.InitializeAsync(CancellationToken.None);
+        var chat = await repository.CreateChatAsync("Close", CancellationToken.None);
+        var run = await repository.CreateRunAsync(chat.Id, "Prompt", CancellationToken.None);
+
+        await orchestrator.CloseBrowserAsync(run.Id, _ => { }, CancellationToken.None);
+
+        var reloaded = await repository.GetChatAsync(chat.Id, CancellationToken.None);
+        var persistedRun = Assert.Single(reloaded!.Runs);
+        Assert.Equal(RestoreStatus.Closed, persistedRun.BrowserSnapshot.RestoreStatus);
     }
 
     [Fact]
@@ -1088,20 +1168,43 @@ public sealed class OrchestrationTests
 
     private sealed class FakeBrowserManager : IBrowserSessionManager
     {
-        public List<Guid> RestoreRequests { get; } = [];
+        private readonly Dictionary<Guid, BrowserSessionSnapshot> snapshots = [];
         public List<(string ToolName, JsonObject Arguments)> ExecutedTools { get; } = [];
 
-        public Task CloseBrowserAsync(Guid testRunId, CancellationToken cancellationToken) => Task.CompletedTask;
+        public Task CloseBrowserAsync(Guid testRunId, CancellationToken cancellationToken)
+        {
+            snapshots[testRunId] = new BrowserSessionSnapshot
+            {
+                TestRunId = testRunId,
+                RestoreStatus = RestoreStatus.Closed,
+                LastCapturedAtUtc = DateTime.UtcNow,
+            };
+            return Task.CompletedTask;
+        }
+
         public Task<ToolExecutionResult> ExecuteBrowserToolAsync(Guid testRunId, string toolName, JsonObject arguments, BrowserSessionSnapshot? persistedSnapshot, bool headless, CancellationToken cancellationToken)
         {
             ExecutedTools.Add((toolName, (JsonObject)arguments.DeepClone()));
             return Task.FromResult(ToolExecutionResult.Successful(toolName));
         }
-        public Task<BrowserSessionSnapshot?> GetSnapshotAsync(Guid testRunId, CancellationToken cancellationToken) => Task.FromResult<BrowserSessionSnapshot?>(new BrowserSessionSnapshot { TestRunId = testRunId });
-        public Task<BrowserSessionSnapshot> OpenBrowserAsync(Guid testRunId, string? startUrl, string profilePath, bool headless, CancellationToken cancellationToken) => Task.FromResult(new BrowserSessionSnapshot { TestRunId = testRunId, CurrentUrl = startUrl, ProfilePath = profilePath });
-        public Task<BrowserSessionSnapshot> RestoreBrowserAsync(Guid testRunId, BrowserSessionSnapshot snapshot, bool headless, CancellationToken cancellationToken)
+
+        public Task<BrowserSessionSnapshot?> GetSnapshotAsync(Guid testRunId, CancellationToken cancellationToken) =>
+            Task.FromResult<BrowserSessionSnapshot?>(
+                snapshots.TryGetValue(testRunId, out var snapshot)
+                    ? snapshot
+                    : new BrowserSessionSnapshot { TestRunId = testRunId });
+
+        public Task<BrowserSessionSnapshot> OpenBrowserAsync(Guid testRunId, string? startUrl, string profilePath, bool headless, CancellationToken cancellationToken)
         {
-            RestoreRequests.Add(testRunId);
+            var snapshot = new BrowserSessionSnapshot
+            {
+                TestRunId = testRunId,
+                CurrentUrl = startUrl,
+                ProfilePath = profilePath,
+                RestoreStatus = RestoreStatus.Active,
+                LastCapturedAtUtc = DateTime.UtcNow,
+            };
+            snapshots[testRunId] = snapshot;
             return Task.FromResult(snapshot);
         }
     }

@@ -24,7 +24,6 @@ public interface IToolExecutor
 public interface IBrowserSessionManager
 {
     Task<BrowserSessionSnapshot> OpenBrowserAsync(Guid testRunId, string? startUrl, string profilePath, bool headless, CancellationToken cancellationToken);
-    Task<BrowserSessionSnapshot> RestoreBrowserAsync(Guid testRunId, BrowserSessionSnapshot snapshot, bool headless, CancellationToken cancellationToken);
     Task<BrowserSessionSnapshot?> GetSnapshotAsync(Guid testRunId, CancellationToken cancellationToken);
     Task<ToolExecutionResult> ExecuteBrowserToolAsync(Guid testRunId, string toolName, JsonObject arguments, BrowserSessionSnapshot? persistedSnapshot, bool headless, CancellationToken cancellationToken);
     Task CloseBrowserAsync(Guid testRunId, CancellationToken cancellationToken);
@@ -76,7 +75,8 @@ public interface IChatOrchestrator
     Task InitializeAsync(CancellationToken cancellationToken);
     Task<IReadOnlyList<ChatSessionSummary>> ListChatsAsync(CancellationToken cancellationToken);
     Task<ChatSession> CreateChatAsync(string? title, CancellationToken cancellationToken);
-    Task<ChatSession?> LoadChatAsync(Guid chatId, bool restoreBrowser, Action<OrchestratorUpdate>? onUpdate, CancellationToken cancellationToken);
+    Task<ChatSession?> LoadChatAsync(Guid chatId, Action<OrchestratorUpdate>? onUpdate, CancellationToken cancellationToken);
+    Task<BrowserSessionSnapshot?> CloseBrowserAsync(Guid runId, Action<OrchestratorUpdate>? onUpdate, CancellationToken cancellationToken);
     Task<BrowserSessionSnapshot?> RefreshBrowserSnapshotAsync(Guid runId, Action<OrchestratorUpdate>? onUpdate, CancellationToken cancellationToken);
     Task<TestRun> RunPromptAsync(Guid chatId, string prompt, Action<OrchestratorUpdate> onUpdate, CancellationToken cancellationToken);
 }

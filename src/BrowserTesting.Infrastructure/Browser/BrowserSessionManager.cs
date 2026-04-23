@@ -16,8 +16,7 @@ public sealed class BrowserSessionManager(AppSettings settings) : IBrowserSessio
 
     public async Task<BrowserSessionSnapshot> OpenBrowserAsync(Guid testRunId, string? startUrl, string profilePath, bool headless, CancellationToken cancellationToken)
     {
-        await sessionGate.WaitAsync(cancellationToken);
-        try
+        return await RunLockedAsync(() =>
         {
             CloseActiveSessionLocked();
 
@@ -30,49 +29,12 @@ public sealed class BrowserSessionManager(AppSettings settings) : IBrowserSessio
             }
 
             return CaptureAndCacheSnapshotLocked(session, RestoreStatus.Active);
-        }
-        finally
-        {
-            sessionGate.Release();
-        }
-    }
-
-    public async Task<BrowserSessionSnapshot> RestoreBrowserAsync(Guid testRunId, BrowserSessionSnapshot snapshot, bool headless, CancellationToken cancellationToken)
-    {
-        await sessionGate.WaitAsync(cancellationToken);
-        try
-        {
-            if (activeSession?.TestRunId == testRunId && IsSessionAlive(activeSession))
-            {
-                return CaptureAndCacheSnapshotLocked(activeSession, RestoreStatus.Active);
-            }
-
-            CloseActiveSessionLocked();
-
-            var profilePath = string.IsNullOrWhiteSpace(snapshot.ProfilePath)
-                ? Path.Combine(settings.ChromeProfileRoot, testRunId.ToString("N"))
-                : snapshot.ProfilePath;
-
-            var session = CreateSession(testRunId, profilePath, headless);
-            activeSession = session;
-
-            if (!string.IsNullOrWhiteSpace(snapshot.CurrentUrl))
-            {
-                session.Driver.Navigate().GoToUrl(snapshot.CurrentUrl);
-            }
-
-            return CaptureAndCacheSnapshotLocked(session, RestoreStatus.RestoredBestEffort);
-        }
-        finally
-        {
-            sessionGate.Release();
-        }
+        }, cancellationToken);
     }
 
     public async Task<BrowserSessionSnapshot?> GetSnapshotAsync(Guid testRunId, CancellationToken cancellationToken)
     {
-        await sessionGate.WaitAsync(cancellationToken);
-        try
+        return await RunLockedAsync(() =>
         {
             if (activeSession?.TestRunId == testRunId)
             {
@@ -87,11 +49,7 @@ public sealed class BrowserSessionManager(AppSettings settings) : IBrowserSessio
             return snapshots.TryGetValue(testRunId, out var snapshot)
                 ? CloneSnapshot(snapshot)
                 : null;
-        }
-        finally
-        {
-            sessionGate.Release();
-        }
+        }, cancellationToken);
     }
 
     public async Task<ToolExecutionResult> ExecuteBrowserToolAsync(
@@ -116,8 +74,7 @@ public sealed class BrowserSessionManager(AppSettings settings) : IBrowserSessio
             return ToolExecutionResult.Successful("Browser closed.");
         }
 
-        await sessionGate.WaitAsync(cancellationToken);
-        try
+        return await RunLockedAsync(async () =>
         {
             if (activeSession?.TestRunId != testRunId)
             {
@@ -180,17 +137,12 @@ public sealed class BrowserSessionManager(AppSettings settings) : IBrowserSessio
                 MarkActiveSessionClosedLocked();
                 return ToolExecutionResult.Failed("Browser window is closed.", ex.Message);
             }
-        }
-        finally
-        {
-            sessionGate.Release();
-        }
+        }, cancellationToken);
     }
 
     public async Task CloseBrowserAsync(Guid testRunId, CancellationToken cancellationToken)
     {
-        await sessionGate.WaitAsync(cancellationToken);
-        try
+        await RunLockedAsync(() =>
         {
             if (activeSession?.TestRunId == testRunId)
             {
@@ -202,11 +154,7 @@ public sealed class BrowserSessionManager(AppSettings settings) : IBrowserSessio
             {
                 snapshots[testRunId] = CloseSnapshot(snapshot);
             }
-        }
-        finally
-        {
-            sessionGate.Release();
-        }
+        }, cancellationToken);
     }
 
     private BrowserSession CreateSession(Guid testRunId, string profilePath, bool headless)
@@ -225,7 +173,6 @@ public sealed class BrowserSessionManager(AppSettings settings) : IBrowserSessio
         }
         else
         {
-            options.AddArgument("--window-position=0,0");
             options.AddArgument("--window-size=1920,1080");
             options.AddArgument("--no-first-run");
             options.AddArgument("--no-default-browser-check");
@@ -819,6 +766,45 @@ public sealed class BrowserSessionManager(AppSettings settings) : IBrowserSessio
         catch
         {
             return null;
+        }
+    }
+
+    private async Task<T> RunLockedAsync<T>(Func<T> action, CancellationToken cancellationToken)
+    {
+        await sessionGate.WaitAsync(cancellationToken);
+        try
+        {
+            return await Task.Run(action, cancellationToken);
+        }
+        finally
+        {
+            sessionGate.Release();
+        }
+    }
+
+    private async Task<T> RunLockedAsync<T>(Func<Task<T>> action, CancellationToken cancellationToken)
+    {
+        await sessionGate.WaitAsync(cancellationToken);
+        try
+        {
+            return await Task.Run(action, cancellationToken);
+        }
+        finally
+        {
+            sessionGate.Release();
+        }
+    }
+
+    private async Task RunLockedAsync(Action action, CancellationToken cancellationToken)
+    {
+        await sessionGate.WaitAsync(cancellationToken);
+        try
+        {
+            await Task.Run(action, cancellationToken);
+        }
+        finally
+        {
+            sessionGate.Release();
         }
     }
 
