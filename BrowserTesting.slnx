@@ -4,7 +4,5 @@
     <Project Path="src/BrowserTesting.Desktop/BrowserTesting.Desktop.csproj" />
     <Project Path="src/BrowserTesting.Infrastructure/BrowserTesting.Infrastructure.csproj" />
   </Folder>
-  <Folder Name="/tests/">
-    <Project Path="tests/BrowserTesting.Tests/BrowserTesting.Tests.csproj" />
-  </Folder>
+  
 </Solution>
