@@ -71,6 +71,7 @@ public sealed class ToolExecutor(
                 ["evidence"] = normalizedArguments["evidence"]?.DeepClone(),
             }, cancellationToken),
             "list_goals" => await ListGoalsAsync(context, cancellationToken),
+            "end_task" => await EndTaskAsync(context, normalizedArguments, cancellationToken),
             "save_secret" => await SaveSecretAsync(context, normalizedArguments, cancellationToken),
             "get_secret" => await GetSecretAsync(context, normalizedArguments, cancellationToken),
             "list_secrets" => await ListSecretsAsync(context, cancellationToken),
@@ -111,6 +112,16 @@ public sealed class ToolExecutor(
             return ToolExecutionResult.Failed("Goal title and success criteria are required.");
         }
 
+        var existingGoals = await goalService.ListGoalsAsync(context.TestRunId, cancellationToken);
+        var existingGoal = existingGoals.FirstOrDefault(goal => IsDuplicateGoal(goal, title, successCriteria));
+        if (existingGoal is not null)
+        {
+            return ToolExecutionResult.Successful(
+                "Goal already exists.",
+                GoalNode(existingGoal),
+                "Use the existing active-run goal ID. Do not create a duplicate goal.");
+        }
+
         var goal = await goalService.CreateGoalAsync(context.ChatSessionId, context.TestRunId, title, successCriteria, cancellationToken);
         return ToolExecutionResult.Successful("Goal created.", GoalNode(goal));
     }
@@ -145,6 +156,57 @@ public sealed class ToolExecutor(
     {
         var goals = await goalService.ListGoalsAsync(context.TestRunId, cancellationToken);
         return ToolExecutionResult.Successful("Goals listed.", new JsonArray(goals.Select(GoalNode).ToArray()));
+    }
+
+    private async Task<ToolExecutionResult> EndTaskAsync(ToolInvocationContext context, JsonObject arguments, CancellationToken cancellationToken)
+    {
+        var outcome = GetString(arguments, "outcome");
+        var summary = GetString(arguments, "summary");
+        var evidence = GetString(arguments, "evidence");
+        var remainingWork = GetString(arguments, "remaining_work");
+
+        if (outcome is not ("completed" or "failed"))
+        {
+            return ToolExecutionResult.Failed("End task outcome must be completed or failed.");
+        }
+
+        if (string.IsNullOrWhiteSpace(summary) ||
+            string.IsNullOrWhiteSpace(evidence) ||
+            string.IsNullOrWhiteSpace(remainingWork))
+        {
+            return ToolExecutionResult.Failed("End task summary, evidence, and remaining_work are required.");
+        }
+
+        var goals = await goalService.ListGoalsAsync(context.TestRunId, cancellationToken);
+        var unresolved = goals
+            .Where(goal => goal.Status is GoalStatus.Pending or GoalStatus.Running)
+            .ToArray();
+
+        if (goals.Count == 0 || unresolved.Length > 0)
+        {
+            return ToolExecutionResult.Failed(
+                "Cannot end task until every active-run goal is passed or failed.",
+                goals.Count == 0
+                    ? "No goals exist for the active run."
+                    : "Some active-run goals are still pending or running.",
+                data: new JsonObject
+                {
+                    ["unresolved_goals"] = new JsonArray(unresolved.Select(GoalNode).ToArray()),
+                },
+                hint: "Use list_goals, inspect current browser evidence, then mark each active-run goal passed or failed before calling end_task again.");
+        }
+
+        var hasFailedGoal = goals.Any(goal => goal.Status == GoalStatus.Failed);
+        return ToolExecutionResult.Successful(
+            "Task ended.",
+            new JsonObject
+            {
+                ["outcome"] = hasFailedGoal ? "failed" : outcome,
+                ["summary"] = summary.Trim(),
+                ["evidence"] = evidence.Trim(),
+                ["remaining_work"] = remainingWork.Trim(),
+                ["goals"] = new JsonArray(goals.Select(GoalNode).ToArray()),
+            });
     }
 
     private async Task<ToolExecutionResult> SaveSecretAsync(ToolInvocationContext context, JsonObject arguments, CancellationToken cancellationToken)
@@ -199,6 +261,41 @@ public sealed class ToolExecutor(
         arguments[name] is JsonValue value && value.TryGetValue<string>(out var result)
             ? result
             : null;
+
+    private static string NormalizeGoalText(string value)
+    {
+        var normalized = new string(value
+            .Where(character => !char.IsPunctuation(character))
+            .Select(char.ToLowerInvariant)
+            .ToArray());
+        return string.Join(' ', normalized.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
+    }
+
+    private static bool IsDuplicateGoal(GoalItem goal, string title, string successCriteria)
+    {
+        var existingTitle = NormalizeGoalText(goal.Title);
+        var requestedTitle = NormalizeGoalText(title);
+        var existingCriteria = NormalizeGoalText(goal.SuccessCriteria);
+        var requestedCriteria = NormalizeGoalText(successCriteria);
+
+        return string.Equals(existingTitle, requestedTitle, StringComparison.Ordinal) ||
+               string.Equals(existingCriteria, requestedCriteria, StringComparison.Ordinal) ||
+               TokenSimilarity(existingCriteria, requestedCriteria) >= 0.75d;
+    }
+
+    private static double TokenSimilarity(string left, string right)
+    {
+        var leftTokens = left.Split(' ', StringSplitOptions.RemoveEmptyEntries).ToHashSet(StringComparer.Ordinal);
+        var rightTokens = right.Split(' ', StringSplitOptions.RemoveEmptyEntries).ToHashSet(StringComparer.Ordinal);
+        if (leftTokens.Count == 0 || rightTokens.Count == 0)
+        {
+            return 0d;
+        }
+
+        var intersection = leftTokens.Intersect(rightTokens, StringComparer.Ordinal).Count();
+        var union = leftTokens.Union(rightTokens, StringComparer.Ordinal).Count();
+        return union == 0 ? 0d : (double)intersection / union;
+    }
 
     private static JsonObject NormalizeArguments(string toolName, LlmToolDefinition? definition, JsonObject arguments)
     {

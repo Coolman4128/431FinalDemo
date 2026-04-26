@@ -1,5 +1,4 @@
 using System.Text;
-using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
 using BrowserTesting.Core.Abstractions;
@@ -113,8 +112,10 @@ public sealed class ChatOrchestrator(
         try
         {
             var repeatedFailures = new RepeatedFailureTracker();
+            var passiveLoop = new PassiveToolLoopTracker();
             var stalledTurns = 0;
-            for (var iteration = 0; iteration < settings.MaxToolIterations; iteration++)
+            var taskEnded = false;
+            for (var iteration = 0; !taskEnded; iteration++)
             {
                 cancellationToken.ThrowIfCancellationRequested();
 
@@ -145,7 +146,7 @@ public sealed class ChatOrchestrator(
                 var toolDefinitions = toolRegistry.GetToolDefinitions();
                 var toolNames = toolDefinitions.Select(definition => definition.Name).ToArray();
                 var toolBuilders = new Dictionary<int, ToolCallAccumulator>();
-                await foreach (var streamEvent in llmClient.StreamCompletionAsync(BuildRequest(chat, run, settings.MaxToolIterations - iteration, connection), cancellationToken))
+                await foreach (var streamEvent in llmClient.StreamCompletionAsync(BuildRequest(chat, run, Math.Max(settings.MaxToolIterations - iteration, 0), connection), cancellationToken))
                 {
                     switch (streamEvent)
                     {
@@ -242,35 +243,15 @@ public sealed class ChatOrchestrator(
                     }
 
                     run = await RefreshRunStateAsync(chatId, run.Id, onUpdate, cancellationToken);
-                    run.Status = InferRunStatusFromGoals(run);
-                    if (run.Status is TestRunStatus.Completed or TestRunStatus.Failed)
-                    {
-                        run.CompletedAtUtc = DateTime.UtcNow;
-                        run.UpdatedAtUtc = DateTime.UtcNow;
-                        await repository.UpdateRunAsync(run, cancellationToken);
-                        onUpdate(new RunUpdated(run));
-                        break;
-                    }
-
-                    if (stalledTurns >= 3)
-                    {
-                        run.Status = TestRunStatus.Failed;
-                        run.FailureReason = "The model produced repeated empty or no-tool turns while goals were still unresolved.";
-                        run.CompletedAtUtc = DateTime.UtcNow;
-                        run.UpdatedAtUtc = DateTime.UtcNow;
-                        await repository.UpdateRunAsync(run, cancellationToken);
-                        onUpdate(new RunUpdated(run));
-                        break;
-                    }
-
                     await AddSystemNoticeAsync(
                         chatId,
                         run.Id,
-                        "Goals are still unresolved. Continue using tools until you have enough evidence to pass or fail them.",
+                        BuildNoToolNotice(run, stalledTurns),
                         onUpdate,
                         cancellationToken);
 
                     run.Status = TestRunStatus.Running;
+                    run.FailureReason = null;
                     run.CompletedAtUtc = null;
                     run.UpdatedAtUtc = DateTime.UtcNow;
                     await repository.UpdateRunAsync(run, cancellationToken);
@@ -286,7 +267,6 @@ public sealed class ChatOrchestrator(
                 onUpdate(new RunUpdated(run));
 
                 var restartAfterToolFailure = false;
-                var stopForRepeatedFailureLoop = false;
                 foreach (var toolCall in toolBuilders.Values.OrderBy(candidate => candidate.Index).Select(candidate => candidate.Build()))
                 {
                     var arguments = ParseArguments(toolCall);
@@ -330,12 +310,15 @@ public sealed class ChatOrchestrator(
 
                     run = await RefreshRunStateAsync(chatId, run.Id, onUpdate, cancellationToken);
                     var repeatedAttemptCount = 0;
+                    var passiveAttemptCount = 0;
                     if (result.Success)
                     {
                         repeatedFailures.Reset();
+                        passiveAttemptCount = passiveLoop.Register(toolCall.Name);
                     }
                     else
                     {
+                        passiveLoop.Reset();
                         repeatedAttemptCount = repeatedFailures.RegisterFailure(
                             BuildFailureSignature(
                                 toolCall.Name,
@@ -363,6 +346,32 @@ public sealed class ChatOrchestrator(
                     onUpdate(new TimelineEntryUpserted(finishedEntry));
                     run = await RefreshRunStateAsync(chatId, run.Id, onUpdate, cancellationToken);
 
+                    if (passiveAttemptCount >= 3)
+                    {
+                        await AddSystemNoticeAsync(
+                            chatId,
+                            run.Id,
+                            BuildPassiveToolLoopNotice(toolCall.Name, passiveAttemptCount),
+                            onUpdate,
+                            cancellationToken);
+                    }
+
+                    if (result.Success && string.Equals(toolCall.Name, "end_task", StringComparison.Ordinal))
+                    {
+                        run.Status = run.Goals.Any(goal => goal.Status == GoalStatus.Failed)
+                            ? TestRunStatus.Failed
+                            : TestRunStatus.Completed;
+                        run.FailureReason = run.Status == TestRunStatus.Failed
+                            ? ExtractEndTaskSummary(result) ?? "One or more goals failed."
+                            : null;
+                        run.CompletedAtUtc = DateTime.UtcNow;
+                        run.UpdatedAtUtc = DateTime.UtcNow;
+                        await repository.UpdateRunAsync(run, cancellationToken);
+                        onUpdate(new RunUpdated(run));
+                        taskEnded = true;
+                        break;
+                    }
+
                     if (!result.Success)
                     {
                         await AddSystemNoticeAsync(
@@ -371,18 +380,6 @@ public sealed class ChatOrchestrator(
                             BuildToolFailureNotice(toolCall.Name, result, repeatedAttemptCount),
                             onUpdate,
                             cancellationToken);
-
-                        if (repeatedAttemptCount >= 3)
-                        {
-                            run.Status = TestRunStatus.Failed;
-                            run.FailureReason = $"Stopped after {repeatedAttemptCount} identical `{toolCall.Name}` failures. Change strategy instead of repeating the same tool call.";
-                            run.CompletedAtUtc = DateTime.UtcNow;
-                            run.UpdatedAtUtc = DateTime.UtcNow;
-                            await repository.UpdateRunAsync(run, cancellationToken);
-                            onUpdate(new RunUpdated(run));
-                            stopForRepeatedFailureLoop = true;
-                            break;
-                        }
 
                         run.Status = TestRunStatus.Running;
                         run.FailureReason = null;
@@ -400,27 +397,6 @@ public sealed class ChatOrchestrator(
                 {
                     continue;
                 }
-
-                if (stopForRepeatedFailureLoop)
-                {
-                    break;
-                }
-            }
-
-            run = await RefreshRunStateAsync(chatId, run.Id, onUpdate, cancellationToken);
-            if (run.Status is not TestRunStatus.Completed and not TestRunStatus.Failed and not TestRunStatus.Cancelled)
-            {
-                run.Status = InferRunStatusFromGoals(run);
-                if (run.Status is not TestRunStatus.Completed and not TestRunStatus.Failed)
-                {
-                    run.Status = TestRunStatus.Failed;
-                    run.FailureReason = $"The run did not finish within {settings.MaxToolIterations} LLM turns.";
-                }
-
-                run.CompletedAtUtc = DateTime.UtcNow;
-                run.UpdatedAtUtc = DateTime.UtcNow;
-                await repository.UpdateRunAsync(run, cancellationToken);
-                onUpdate(new RunUpdated(run));
             }
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
@@ -457,13 +433,19 @@ public sealed class ChatOrchestrator(
         onUpdate(new TimelineEntryUpserted(entry));
     }
 
-    private LlmRequest BuildRequest(ChatSession chat, TestRun run, int turnsRemaining, LlmConnectionSettings connection) =>
-        new()
+    private LlmRequest BuildRequest(ChatSession chat, TestRun run, int turnsRemaining, LlmConnectionSettings connection)
+    {
+        var forceEndTask = CanCallEndTask(run);
+        return new LlmRequest
         {
             Connection = connection,
             Tools = toolRegistry.GetToolDefinitions(),
             Messages = BuildConversation(chat, run, turnsRemaining, connection),
+            ToolChoiceMode = forceEndTask ? LlmToolChoiceMode.ForceFunction : LlmToolChoiceMode.Required,
+            ForcedToolName = forceEndTask ? "end_task" : null,
+            ParallelToolCalls = false,
         };
+    }
 
     private IReadOnlyList<LlmConversationMessage> BuildConversation(
         ChatSession chat,
@@ -478,189 +460,252 @@ public sealed class ChatOrchestrator(
                 Role = connection.Provider == LlmProvider.OpenAi ? "developer" : "system",
                 Content = BuildSystemPrompt(chat, activeRun, turnsRemaining),
             },
+            new()
+            {
+                Role = "user",
+                Content = activeRun.UserPrompt,
+            },
         };
 
-        var pendingAssistantContent = string.Empty;
-        var pendingToolCalls = new List<LlmToolCall>();
-        var pendingToolCallIds = new HashSet<string>(StringComparer.Ordinal);
-        var bufferedMessages = new List<LlmConversationMessage>();
-
-        foreach (var entry in chat.Timeline.OrderBy(candidate => candidate.Sequence))
+        var recentNotices = BuildRecentActiveRunNotices(chat, activeRun.Id);
+        if (!string.IsNullOrWhiteSpace(recentNotices))
         {
-            switch (entry.Kind)
+            messages.Add(new LlmConversationMessage
             {
-                case TimelineItemKind.UserMessage:
-                    FlushBufferedMessages(messages, bufferedMessages);
-                    FlushAssistantMessage(messages, ref pendingAssistantContent, pendingToolCalls);
-                    messages.Add(new LlmConversationMessage { Role = "user", Content = entry.Content });
-                    break;
-                case TimelineItemKind.AssistantMessage:
-                    FlushBufferedMessages(messages, bufferedMessages);
-                    FlushAssistantMessage(messages, ref pendingAssistantContent, pendingToolCalls);
-                    pendingAssistantContent = entry.Content;
-                    break;
-                case TimelineItemKind.ToolCallStarted:
-                    var toolCall = new LlmToolCall
-                    {
-                        Index = pendingToolCalls.Count,
-                        Id = entry.ToolCallId ?? Guid.NewGuid().ToString("N"),
-                        Name = entry.ToolName ?? "unknown_tool",
-                        ArgumentsJson = entry.MetadataJson ?? "{}",
-                    };
-                    pendingToolCalls.Add(toolCall);
-                    pendingToolCallIds.Add(toolCall.Id);
-                    break;
-                case TimelineItemKind.ToolCallFinished:
-                    FlushAssistantMessage(messages, ref pendingAssistantContent, pendingToolCalls);
-                    messages.Add(new LlmConversationMessage
-                    {
-                        Role = "tool",
-                        ToolCallId = entry.ToolCallId,
-                        Name = entry.ToolName,
-                        Content = entry.MetadataJson ?? entry.Content,
-                    });
-                    if (!string.IsNullOrWhiteSpace(entry.ToolCallId))
-                    {
-                        pendingToolCallIds.Remove(entry.ToolCallId);
-                    }
-
-                    FlushBufferedMessagesIfToolBlockCompleted(messages, bufferedMessages, pendingToolCallIds);
-                    break;
-                case TimelineItemKind.SystemNotice:
-                    AddSystemOrBufferedMessage(
-                        messages,
-                        bufferedMessages,
-                        ref pendingAssistantContent,
-                        pendingToolCalls,
-                        pendingToolCallIds,
-                        $"System notice: {entry.Content}");
-                    break;
-                case TimelineItemKind.GoalChanged:
-                    AddSystemOrBufferedMessage(
-                        messages,
-                        bufferedMessages,
-                        ref pendingAssistantContent,
-                        pendingToolCalls,
-                        pendingToolCallIds,
-                        FormatGoalChangedMessage(entry));
-                    break;
-            }
+                Role = "system",
+                Content = recentNotices,
+            });
         }
 
-        FlushAssistantMessage(messages, ref pendingAssistantContent, pendingToolCalls);
-        FlushBufferedMessages(messages, bufferedMessages);
         return messages;
     }
 
-    private static void AddSystemOrBufferedMessage(
-        List<LlmConversationMessage> messages,
-        List<LlmConversationMessage> bufferedMessages,
-        ref string pendingAssistantContent,
-        List<LlmToolCall> pendingToolCalls,
-        HashSet<string> pendingToolCallIds,
-        string content)
+    private static string? BuildRecentActiveRunNotices(ChatSession chat, Guid activeRunId)
     {
-        var message = new LlmConversationMessage
-        {
-            Role = "system",
-            Content = content,
-        };
+        var notices = chat.Timeline
+            .Where(entry => entry.TestRunId == activeRunId && entry.Kind == TimelineItemKind.SystemNotice)
+            .OrderByDescending(entry => entry.Sequence)
+            .Take(3)
+            .Reverse()
+            .Select(entry => Truncate(entry.Content, 700))
+            .Where(content => !string.IsNullOrWhiteSpace(content))
+            .ToArray();
 
-        if (pendingToolCallIds.Count > 0 || pendingToolCalls.Count > 0)
-        {
-            bufferedMessages.Add(message);
-            return;
-        }
-
-        FlushBufferedMessages(messages, bufferedMessages);
-        FlushAssistantMessage(messages, ref pendingAssistantContent, pendingToolCalls);
-        messages.Add(message);
-    }
-
-    private static void FlushBufferedMessagesIfToolBlockCompleted(
-        List<LlmConversationMessage> messages,
-        List<LlmConversationMessage> bufferedMessages,
-        HashSet<string> pendingToolCallIds)
-    {
-        if (pendingToolCallIds.Count == 0)
-        {
-            FlushBufferedMessages(messages, bufferedMessages);
-        }
-    }
-
-    private static void FlushBufferedMessages(
-        List<LlmConversationMessage> messages,
-        List<LlmConversationMessage> bufferedMessages)
-    {
-        if (bufferedMessages.Count == 0)
-        {
-            return;
-        }
-
-        messages.AddRange(bufferedMessages);
-        bufferedMessages.Clear();
+        return notices.Length == 0
+            ? null
+            : $"recent_active_run_notices: {string.Join(" | ", notices)}";
     }
 
     private string BuildSystemPrompt(ChatSession chat, TestRun activeRun, int turnsRemaining)
     {
         var builder = new StringBuilder();
-        builder.AppendLine("You are a browser-testing agent controlling Selenium tools.");
-        builder.AppendLine("Operating playbook:");
-        builder.AppendLine("- Always create explicit goals before significant browser work.");
-        builder.AppendLine("- Update goals as work progresses and only mark them passed or failed from observed page evidence.");
-        builder.AppendLine("- If any goal is still pending or running, continue using tools until it is resolved.");
-        builder.AppendLine("- Inspect browser/page state before guessing selectors or outcomes.");
-        builder.AppendLine("- Use exact tool argument names and shapes from the tool schema.");
-        builder.AppendLine("- If a tool fails, read the tool result JSON and change strategy. Do not repeat the same tool name with the same arguments.");
-        builder.AppendLine("- After repeated failures, switch approach, inspect state, or fail the relevant goal with evidence if blocked.");
-        builder.AppendLine("- Keep assistant text brief and useful. Tool activity is rendered separately in the UI.");
+        builder.AppendLine("You are a browser-testing agent. Drive the browser with tools and maintain the active-run goal ledger.");
+        builder.AppendLine("Rules:");
+        builder.AppendLine("- Use tools every turn. Do not narrate progress instead of calling a tool.");
+        builder.AppendLine("- If the user listed goals, create each distinct requested goal once. Do not recreate semantically equivalent goals.");
+        builder.AppendLine("- active_run.goals is already current. Do not call list_goals just to rediscover the same IDs.");
+        builder.AppendLine("- Only use goal IDs from active_run.goals. Previous-run summaries are not actionable.");
+        builder.AppendLine("- Do not call open_browser when active_run.browser.restore_status is Active; continue from the current page.");
+        builder.AppendLine("- After inspect_page returns usable refs, act on those refs. Do not inspect the same unchanged page repeatedly.");
+        builder.AppendLine("- Resolve every active-run goal as passed or failed with observed evidence.");
+        builder.AppendLine("- When every active-run goal is passed or failed, call end_task next.");
+        builder.AppendLine("- If end_task fails, resolve the returned unresolved goals, then call end_task again.");
+        builder.AppendLine("- Prefer inspect_page, then click_ref/type_ref. Use selector tools only when refs are insufficient.");
+        builder.AppendLine("- On tool failure, change strategy. Do not repeat identical failing calls.");
         builder.AppendLine();
-        builder.AppendLine("Critical tool shapes:");
-        builder.AppendLine("- Locator tools such as find_element, click, get_text, type_text, wait_for_element: {\"locator\":{\"strategy\":\"css\",\"value\":\"input[name='q']\"}}");
+        builder.AppendLine("Critical shapes:");
+        builder.AppendLine("- inspect_page: {\"max_elements\":40,\"include_hidden\":false}");
+        builder.AppendLine("- click_ref/type_ref use refs returned by the latest inspect_page call.");
+        builder.AppendLine("- Locator tools: {\"locator\":{\"strategy\":\"css\",\"value\":\"input[name='q']\"}}");
         builder.AppendLine("- mark_goal_pass: {\"goal_id\":\"<goal-id>\",\"evidence\":\"Observed expected result on the page.\"}");
         builder.AppendLine("- mark_goal_fail: {\"goal_id\":\"<goal-id>\",\"reason\":\"Why the goal failed.\",\"evidence\":\"Observed blocking evidence.\"}");
-        builder.AppendLine("- update_goal_status: {\"goal_id\":\"<goal-id>\",\"status\":\"running|passed|failed\",\"note\":\"Optional note\",\"evidence\":\"Optional evidence\"}");
+        builder.AppendLine("- end_task: {\"outcome\":\"completed|failed\",\"summary\":\"...\",\"evidence\":\"...\",\"remaining_work\":\"none|...\"}");
         builder.AppendLine();
-        builder.AppendLine("Current run state (treat this as the source of truth for the active run):");
-        builder.AppendLine(JsonSerializer.Serialize(new
-        {
-            activeRun.Id,
-            Status = activeRun.Status.ToString(),
-            activeRun.UserPrompt,
-            Browser = activeRun.BrowserSnapshot,
-            Goals = activeRun.Goals,
-            SavedSecrets = secretStore.ListSecretNamesAsync(chat.Id, CancellationToken.None).GetAwaiter().GetResult(),
-        }));
-        builder.AppendLine();
-        builder.AppendLine("Recent execution context:");
-        builder.AppendLine(JsonSerializer.Serialize(new
-        {
-            TurnsRemaining = turnsRemaining,
-            Browser = activeRun.BrowserSnapshot,
-            ConsecutiveFailureCount = GetConsecutiveFailureCount(chat, activeRun.Id),
-            RecentToolOutcomes = GetRecentToolOutcomes(chat, activeRun.Id),
-        }));
+        builder.AppendLine("active_run:");
+        builder.AppendLine(BuildActiveRunContext(chat, activeRun, turnsRemaining).ToJsonString());
         return builder.ToString();
     }
 
-    private static void FlushAssistantMessage(List<LlmConversationMessage> messages, ref string pendingAssistantContent, List<LlmToolCall> pendingToolCalls)
+    private JsonObject BuildActiveRunContext(ChatSession chat, TestRun activeRun, int turnsRemaining)
     {
-        if (string.IsNullOrWhiteSpace(pendingAssistantContent) && pendingToolCalls.Count == 0)
+        var secrets = new JsonArray();
+        foreach (var name in secretStore.ListSecretNamesAsync(chat.Id, CancellationToken.None).GetAwaiter().GetResult())
         {
-            return;
+            secrets.Add(name);
         }
 
-        messages.Add(new LlmConversationMessage
+        return new JsonObject
         {
-            Role = "assistant",
-            Content = pendingToolCalls.Count > 0
-                ? null
-                : string.IsNullOrWhiteSpace(pendingAssistantContent) ? null : pendingAssistantContent,
-            ToolCalls = pendingToolCalls.Count == 0 ? null : pendingToolCalls.ToArray(),
-        });
+            ["run_id"] = activeRun.Id.ToString(),
+            ["status"] = activeRun.Status.ToString(),
+            ["user_prompt"] = Truncate(activeRun.UserPrompt, 2000),
+            ["expected_goal_count"] = GetExpectedGoalCount(activeRun.UserPrompt),
+            ["active_goal_count"] = activeRun.Goals.Count,
+            ["completion_gate"] = CanCallEndTask(activeRun)
+                ? "All active-run goals are terminal. The next tool call must be end_task."
+                : BuildCompletionGateMessage(activeRun),
+            ["soft_turn_budget_remaining"] = turnsRemaining,
+            ["goals"] = BuildGoalLedger(activeRun.Goals, includeIds: true),
+            ["browser"] = BuildBrowserSnapshotNode(activeRun.BrowserSnapshot),
+            ["saved_secret_names"] = secrets,
+            ["recent_tool_outcomes"] = GetRecentToolOutcomes(chat, activeRun.Id),
+            ["last_page_inspection"] = GetLastPageInspection(chat, activeRun.Id),
+            ["previous_runs_summary"] = BuildPreviousRunSummary(chat, activeRun.Id),
+        };
+    }
 
-        pendingAssistantContent = string.Empty;
-        pendingToolCalls.Clear();
+    private static bool CanCallEndTask(TestRun run)
+    {
+        var expectedGoalCount = GetExpectedGoalCount(run.UserPrompt);
+        return run.Goals.Count > 0 &&
+               (expectedGoalCount is null || run.Goals.Count >= expectedGoalCount.Value) &&
+               run.Goals.All(goal => goal.Status is GoalStatus.Passed or GoalStatus.Failed);
+    }
+
+    private static string BuildCompletionGateMessage(TestRun run)
+    {
+        var expectedGoalCount = GetExpectedGoalCount(run.UserPrompt);
+        if (expectedGoalCount is { } expected && run.Goals.Count < expected)
+        {
+            return $"The user requested {expected} goals, but only {run.Goals.Count} active-run goals exist. Create the missing distinct goals before end_task.";
+        }
+
+        if (run.Goals.Count == 0)
+        {
+            return "No active-run goals exist. Create one or more goals before browser work.";
+        }
+
+        var unresolved = run.Goals
+            .Where(goal => goal.Status is GoalStatus.Pending or GoalStatus.Running)
+            .Select(goal => goal.Id.ToString())
+            .ToArray();
+
+        return unresolved.Length == 0
+            ? "Every active-run goal must be terminal before end_task."
+            : $"Resolve these active-run goal IDs before end_task: {string.Join(", ", unresolved)}";
+    }
+
+    private static int? GetExpectedGoalCount(string prompt)
+    {
+        var match = Regex.Match(
+            prompt,
+            @"\b(?:make|create|have|want)\s+(?<count>\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+goals?\b",
+            RegexOptions.IgnoreCase);
+        if (!match.Success)
+        {
+            match = Regex.Match(
+                prompt,
+                @"\b(?<count>\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+goals?\b",
+                RegexOptions.IgnoreCase);
+        }
+
+        if (!match.Success)
+        {
+            return null;
+        }
+
+        var rawCount = match.Groups["count"].Value;
+        if (int.TryParse(rawCount, out var numeric))
+        {
+            return Math.Clamp(numeric, 1, 25);
+        }
+
+        return rawCount.ToLowerInvariant() switch
+        {
+            "one" => 1,
+            "two" => 2,
+            "three" => 3,
+            "four" => 4,
+            "five" => 5,
+            "six" => 6,
+            "seven" => 7,
+            "eight" => 8,
+            "nine" => 9,
+            "ten" => 10,
+            _ => null,
+        };
+    }
+
+    private static JsonArray BuildGoalLedger(IEnumerable<GoalItem> goals, bool includeIds)
+    {
+        var ledger = new JsonArray();
+        foreach (var goal in goals)
+        {
+            var item = new JsonObject
+            {
+                ["title"] = Truncate(goal.Title, 300),
+                ["success_criteria"] = Truncate(goal.SuccessCriteria, 500),
+                ["status"] = goal.Status.ToString(),
+                ["note"] = Truncate(goal.Note, 500),
+                ["evidence"] = Truncate(goal.Evidence, 800),
+            };
+
+            if (includeIds)
+            {
+                item["id"] = goal.Id.ToString();
+            }
+
+            ledger.Add(item);
+        }
+
+        return ledger;
+    }
+
+    private static JsonObject BuildBrowserSnapshotNode(BrowserSessionSnapshot snapshot)
+    {
+        var tabs = new JsonArray();
+        foreach (var tab in snapshot.Tabs.Take(5))
+        {
+            tabs.Add(new JsonObject
+            {
+                ["title"] = Truncate(tab.Title, 200),
+                ["url"] = Truncate(tab.Url, 500),
+                ["is_selected"] = tab.IsSelected,
+            });
+        }
+
+        return new JsonObject
+        {
+            ["current_url"] = Truncate(snapshot.CurrentUrl, 500),
+            ["page_title"] = Truncate(snapshot.PageTitle, 300),
+            ["restore_status"] = snapshot.RestoreStatus.ToString(),
+            ["tab_count"] = snapshot.Tabs.Count,
+            ["tabs"] = tabs,
+        };
+    }
+
+    private static JsonArray BuildPreviousRunSummary(ChatSession chat, Guid activeRunId)
+    {
+        var summaries = new JsonArray();
+        foreach (var run in chat.Runs
+                     .Where(candidate => candidate.Id != activeRunId)
+                     .OrderByDescending(candidate => candidate.UpdatedAtUtc)
+                     .Take(2))
+        {
+            summaries.Add(new JsonObject
+            {
+                ["status"] = run.Status.ToString(),
+                ["user_prompt"] = Truncate(run.UserPrompt, 500),
+                ["failure_reason"] = Truncate(run.FailureReason, 300),
+                ["browser"] = BuildBrowserSnapshotNode(run.BrowserSnapshot),
+                ["goals_without_ids"] = BuildGoalLedger(run.Goals, includeIds: false),
+            });
+        }
+
+        return summaries;
+    }
+
+    private static string? ExtractEndTaskSummary(ToolExecutionResult result)
+    {
+        if (result.Data is JsonObject data &&
+            data["summary"] is JsonValue summaryValue &&
+            summaryValue.TryGetValue<string>(out var summary) &&
+            !string.IsNullOrWhiteSpace(summary))
+        {
+            return summary.Trim();
+        }
+
+        return null;
     }
 
     private static JsonObject ParseArguments(LlmToolCall toolCall)
@@ -1169,6 +1214,32 @@ public sealed class ChatOrchestrator(
             _ => "Repeated empty or no-tool turns detected. If you cannot proceed, use goal evidence to fail the blocked goal instead of returning another empty reply.",
         };
 
+    private static string BuildNoToolNotice(TestRun run, int stalledTurns)
+    {
+        var prefix = stalledTurns > 1
+            ? $"No structured tool call was emitted for {stalledTurns} consecutive turns. "
+            : "No structured tool call was emitted. ";
+
+        if (CanCallEndTask(run))
+        {
+            return prefix + "All active-run goals are passed or failed. Call end_task now with summary, evidence, and remaining_work.";
+        }
+
+        if (run.Goals.Count == 0)
+        {
+            return prefix + "No active-run goals exist. Call create_goal before browser work.";
+        }
+
+        var unresolved = run.Goals
+            .Where(goal => goal.Status is GoalStatus.Pending or GoalStatus.Running)
+            .Select(goal => goal.Id.ToString())
+            .ToArray();
+        return prefix + $"Goals are unresolved ({string.Join(", ", unresolved)}). Use tools to inspect evidence, then mark each goal passed or failed.";
+    }
+
+    private static string BuildPassiveToolLoopNotice(string toolName, int attemptCount) =>
+        $"Passive tool loop detected after {attemptCount} consecutive passive calls ending with `{toolName}`. Use active_run.goals, active_run.browser, and active_run.last_page_inspection from context instead of calling list_goals/open_browser/inspect_page again. The next tool should change page or goal state: create a missing distinct goal, type_ref, click_ref, mark_goal_pass, mark_goal_fail, or end_task when all goals are terminal.";
+
     private static JsonNode CoerceTaggedValue(string rawValue)
     {
         if (bool.TryParse(rawValue, out var boolean))
@@ -1189,29 +1260,19 @@ public sealed class ChatOrchestrator(
         return JsonValue.Create(rawValue);
     }
 
-    private static string FormatGoalChangedMessage(TimelineEntry entry)
-    {
-        if (string.IsNullOrWhiteSpace(entry.MetadataJson))
-        {
-            return $"Goal update: {entry.Content}";
-        }
-
-        return $"Goal update: {entry.Content}\nMetadata: {entry.MetadataJson}";
-    }
-
     private static JsonObject BuildToolResultMetadata(ToolExecutionResult result, int repeatedAttemptCount)
     {
         var metadata = new JsonObject
         {
             ["success"] = result.Success,
-            ["summary"] = result.Summary,
-            ["error"] = result.Error,
-            ["hint"] = result.Hint,
+            ["summary"] = Truncate(result.Summary, 500),
+            ["error"] = Truncate(result.Error, 1000),
+            ["hint"] = Truncate(result.Hint, 1000),
             ["repeated_attempt_count"] = repeatedAttemptCount,
-            ["data"] = result.Data?.DeepClone(),
-            ["normalized_arguments"] = result.NormalizedArguments?.DeepClone(),
-            ["expected_arguments"] = result.ExpectedArguments?.DeepClone(),
-            ["example_arguments"] = result.ExampleArguments?.DeepClone(),
+            ["data"] = CompactJsonNode(result.Data),
+            ["normalized_arguments"] = CompactJsonNode(result.NormalizedArguments),
+            ["expected_arguments"] = CompactJsonNode(result.ExpectedArguments),
+            ["example_arguments"] = CompactJsonNode(result.ExampleArguments),
         };
 
         return metadata;
@@ -1230,20 +1291,20 @@ public sealed class ChatOrchestrator(
             builder.Append($"The tool `{toolName}` failed. ");
         }
 
-        builder.Append($"Error: {result.Error ?? result.Summary}. ");
+        builder.Append($"Error: {Truncate(result.Error ?? result.Summary, 1000)}. ");
         if (!string.IsNullOrWhiteSpace(result.Hint))
         {
-            builder.Append($"Hint: {result.Hint}. ");
+            builder.Append($"Hint: {Truncate(result.Hint, 1000)}. ");
         }
 
         if (result.NormalizedArguments is not null)
         {
-            builder.Append($"Normalized arguments: {result.NormalizedArguments.ToJsonString()}. ");
+            builder.Append($"Normalized arguments: {CompactJsonNode(result.NormalizedArguments, 1000)?.ToJsonString()}. ");
         }
 
         if (result.ExampleArguments is not null)
         {
-            builder.Append($"Example arguments: {result.ExampleArguments.ToJsonString()}. ");
+            builder.Append($"Example arguments: {CompactJsonNode(result.ExampleArguments, 1000)?.ToJsonString()}. ");
         }
 
         builder.Append("Next-step options: inspect page state, change the argument shape, try a different locator strategy, use a less brittle inspection tool, or fail the goal with evidence if the page blocks further progress.");
@@ -1261,6 +1322,73 @@ public sealed class ChatOrchestrator(
             JsonArray array => $"[{string.Join(",", array.Select(CanonicalizeJson))}]",
             _ => node.ToJsonString(),
         };
+
+    private static string? Truncate(string? value, int maxLength)
+    {
+        if (value is null || value.Length <= maxLength)
+        {
+            return value;
+        }
+
+        return value[..maxLength];
+    }
+
+    private static JsonNode? CompactJsonNode(
+        JsonNode? node,
+        int maxStringLength = 1000,
+        int maxArrayItems = 40,
+        int maxObjectProperties = 80)
+    {
+        switch (node)
+        {
+            case null:
+                return null;
+            case JsonValue value when value.TryGetValue<string>(out var text):
+                return JsonValue.Create(Truncate(text, maxStringLength));
+            case JsonValue:
+                return node.DeepClone();
+            case JsonArray array:
+            {
+                var clone = new JsonArray();
+                foreach (var item in array.Take(maxArrayItems))
+                {
+                    clone.Add(CompactJsonNode(item, maxStringLength, maxArrayItems, maxObjectProperties));
+                }
+
+                if (array.Count > maxArrayItems)
+                {
+                    clone.Add(new JsonObject
+                    {
+                        ["_truncated"] = true,
+                        ["omitted_count"] = array.Count - maxArrayItems,
+                    });
+                }
+
+                return clone;
+            }
+            case JsonObject obj:
+            {
+                var clone = new JsonObject();
+                var copied = 0;
+                foreach (var property in obj)
+                {
+                    if (copied >= maxObjectProperties)
+                    {
+                        clone["_truncated"] = true;
+                        clone["omitted_property_count"] = obj.Count - copied;
+                        break;
+                    }
+
+                    clone[property.Key] = CompactJsonNode(property.Value, maxStringLength, maxArrayItems, maxObjectProperties);
+                    copied++;
+                }
+
+                return clone;
+            }
+            default:
+                return node.DeepClone();
+        }
+    }
 
     private static int GetConsecutiveFailureCount(ChatSession chat, Guid runId)
     {
@@ -1288,24 +1416,61 @@ public sealed class ChatOrchestrator(
         foreach (var entry in chat.Timeline
                      .Where(candidate => candidate.TestRunId == runId && candidate.Kind == TimelineItemKind.ToolCallFinished)
                      .OrderByDescending(candidate => candidate.Sequence)
-                     .Take(3)
+                     .Take(6)
                      .Reverse())
         {
             var metadata = ParseMetadata(entry.MetadataJson);
             outcomes.Add(new JsonObject
             {
                 ["tool_name"] = entry.ToolName,
-                ["summary"] = entry.Content,
+                ["summary"] = Truncate(entry.Content, 500),
                 ["success"] = metadata?["success"]?.DeepClone(),
-                ["error"] = metadata?["error"]?.DeepClone(),
-                ["hint"] = metadata?["hint"]?.DeepClone(),
+                ["error"] = CompactJsonNode(metadata?["error"], 1000),
+                ["hint"] = CompactJsonNode(metadata?["hint"], 1000),
                 ["repeated_attempt_count"] = metadata?["repeated_attempt_count"]?.DeepClone(),
-                ["normalized_arguments"] = metadata?["normalized_arguments"]?.DeepClone(),
+                ["normalized_arguments"] = CompactJsonNode(metadata?["normalized_arguments"], 1000),
+                ["data"] = ShouldIncludeRecentToolData(entry.ToolName)
+                    ? CompactJsonNode(metadata?["data"], 700, 20, 60)
+                    : null,
             });
         }
 
         return outcomes;
     }
+
+    private static JsonNode? GetLastPageInspection(ChatSession chat, Guid runId)
+    {
+        var entry = chat.Timeline
+            .Where(candidate =>
+                candidate.TestRunId == runId &&
+                candidate.Kind == TimelineItemKind.ToolCallFinished &&
+                string.Equals(candidate.ToolName, "inspect_page", StringComparison.Ordinal))
+            .OrderByDescending(candidate => candidate.Sequence)
+            .FirstOrDefault(candidate => ParseMetadata(candidate.MetadataJson)?["success"]?.GetValue<bool>() == true);
+
+        if (entry is null)
+        {
+            return null;
+        }
+
+        var metadata = ParseMetadata(entry.MetadataJson);
+        return CompactJsonNode(metadata?["data"], 700, 30, 80);
+    }
+
+    private static bool ShouldIncludeRecentToolData(string? toolName) =>
+        toolName is "inspect_page"
+            or "find_element"
+            or "find_elements"
+            or "get_page_state"
+            or "get_text"
+            or "get_attribute"
+            or "execute_javascript"
+            or "wait_for_text"
+            or "wait_for_navigation"
+            or "click"
+            or "click_ref"
+            or "type_ref"
+            or "open_browser";
 
     private static JsonObject? ParseMetadata(string? metadataJson)
     {
@@ -1356,23 +1521,6 @@ public sealed class ChatOrchestrator(
             cancellationToken);
 
         onUpdate(new TimelineEntryUpserted(entry));
-    }
-
-    private static TestRunStatus InferRunStatusFromGoals(TestRun run)
-    {
-        if (run.Goals.Count == 0)
-        {
-            return TestRunStatus.Completed;
-        }
-
-        if (run.Goals.Any(goal => goal.Status == GoalStatus.Failed))
-        {
-            return TestRunStatus.Failed;
-        }
-
-        return run.Goals.All(goal => goal.Status == GoalStatus.Passed)
-            ? TestRunStatus.Completed
-            : TestRunStatus.Running;
     }
 
     private static string BuildChatTitle(string prompt)
@@ -1453,5 +1601,35 @@ public sealed class ChatOrchestrator(
             lastSignature = null;
             streak = 0;
         }
+    }
+
+    private sealed class PassiveToolLoopTracker
+    {
+        private static readonly HashSet<string> PassiveToolNames =
+        [
+            "list_goals",
+            "inspect_page",
+            "get_page_state",
+            "list_tabs",
+            "open_browser",
+        ];
+
+        private int streak;
+
+        public int Register(string toolName)
+        {
+            if (PassiveToolNames.Contains(toolName))
+            {
+                streak++;
+            }
+            else
+            {
+                streak = 0;
+            }
+
+            return streak;
+        }
+
+        public void Reset() => streak = 0;
     }
 }

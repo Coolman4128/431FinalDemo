@@ -1,4 +1,5 @@
 using System.Net.Http.Headers;
+using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
@@ -22,8 +23,7 @@ public sealed class LmStudioLlmClient(HttpClient httpClient) : ILlmClient
         }
 
         message.Content = new StringContent(payload.ToJsonString(), Encoding.UTF8, "application/json");
-        using var response = await httpClient.SendAsync(message, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
-        await EnsureSuccessAsync(response, cancellationToken);
+        using var response = await SendAsyncWithHttpErrorHandlingAsync(message, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
 
         await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
         using var reader = new StreamReader(stream);
@@ -60,11 +60,6 @@ public sealed class LmStudioLlmClient(HttpClient httpClient) : ILlmClient
                 if (delta.TryGetProperty("content", out var contentElement) && contentElement.ValueKind == JsonValueKind.String)
                 {
                     yield return new LlmTextDelta(contentElement.GetString() ?? string.Empty);
-                }
-
-                if (delta.TryGetProperty("reasoning_content", out var reasoningElement) && reasoningElement.ValueKind == JsonValueKind.String)
-                {
-                    yield return new LlmTextDelta(reasoningElement.GetString() ?? string.Empty);
                 }
 
                 if (delta.TryGetProperty("tool_calls", out var toolCalls) && toolCalls.ValueKind == JsonValueKind.Array)
@@ -111,8 +106,7 @@ public sealed class LmStudioLlmClient(HttpClient httpClient) : ILlmClient
             message.Headers.Authorization = new AuthenticationHeaderValue("Bearer", connection.ApiKey);
         }
 
-        using var response = await httpClient.SendAsync(message, cancellationToken);
-        await EnsureSuccessAsync(response, cancellationToken);
+        using var response = await SendAsyncWithHttpErrorHandlingAsync(message, cancellationToken);
 
         await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
         using var document = await JsonDocument.ParseAsync(stream, cancellationToken: cancellationToken);
@@ -136,6 +130,51 @@ public sealed class LmStudioLlmClient(HttpClient httpClient) : ILlmClient
             : modelIds.OrderBy(id => id, StringComparer.OrdinalIgnoreCase).ToArray();
     }
 
+    private async Task<HttpResponseMessage> SendAsyncWithHttpErrorHandlingAsync(
+        HttpRequestMessage message,
+        CancellationToken cancellationToken) =>
+        await SendAsyncWithHttpErrorHandlingAsync(message, completionOption: null, cancellationToken);
+
+    private async Task<HttpResponseMessage> SendAsyncWithHttpErrorHandlingAsync(
+        HttpRequestMessage message,
+        HttpCompletionOption? completionOption,
+        CancellationToken cancellationToken)
+    {
+        HttpResponseMessage? response = null;
+
+        try
+        {
+            response = completionOption is { } option
+                ? await httpClient.SendAsync(message, option, cancellationToken)
+                : await httpClient.SendAsync(message, cancellationToken);
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            response?.Dispose();
+
+            var errorMessage = $"HTTP request timed out: {FormatRequest(message)}.";
+            Trace.WriteLine(errorMessage);
+            throw new HttpRequestException(errorMessage);
+        }
+        catch (HttpRequestException ex) when (response is null)
+        {
+            var errorMessage = BuildTransportErrorMessage(message, ex);
+            Trace.WriteLine($"{errorMessage}{Environment.NewLine}{ex}");
+            throw new HttpRequestException(errorMessage, ex, ex.StatusCode);
+        }
+
+        try
+        {
+            await EnsureSuccessAsync(response, cancellationToken);
+            return response;
+        }
+        catch
+        {
+            response.Dispose();
+            throw;
+        }
+    }
+
     private static JsonObject BuildPayload(LlmRequest request)
     {
         var payload = new JsonObject
@@ -143,12 +182,57 @@ public sealed class LmStudioLlmClient(HttpClient httpClient) : ILlmClient
             ["model"] = request.Connection.Model,
             ["stream"] = request.Stream,
             ["messages"] = BuildMessages(request.Messages),
-            ["tool_choice"] = "auto",
+            ["tool_choice"] = BuildToolChoice(request),
+            ["parallel_tool_calls"] = request.ParallelToolCalls,
             ["tools"] = BuildTools(request.Tools, request.Connection.Provider),
         };
 
-        payload["temperature"] = request.Connection.Temperature;
+        if (ShouldSendTemperature(request.Connection))
+        {
+            payload["temperature"] = request.Connection.Temperature;
+        }
+
         return payload;
+    }
+
+    private static JsonNode BuildToolChoice(LlmRequest request) =>
+        request.ToolChoiceMode switch
+        {
+            LlmToolChoiceMode.Required => JsonValue.Create("required")!,
+            LlmToolChoiceMode.ForceFunction when !string.IsNullOrWhiteSpace(request.ForcedToolName) => new JsonObject
+            {
+                ["type"] = "function",
+                ["function"] = new JsonObject
+                {
+                    ["name"] = request.ForcedToolName,
+                },
+            },
+            _ => JsonValue.Create("auto")!,
+        };
+
+    private static bool ShouldSendTemperature(LlmConnectionSettings connection)
+    {
+        if (connection.Provider != LlmProvider.OpenAi)
+        {
+            return true;
+        }
+
+        if (!UsesFixedOpenAiTemperature(connection.Model))
+        {
+            return true;
+        }
+
+        return Math.Abs(connection.Temperature - 1.0d) < 0.0001d;
+    }
+
+    private static bool UsesFixedOpenAiTemperature(string model)
+    {
+        var normalized = model.Trim().ToLowerInvariant();
+        return normalized.StartsWith("gpt-5", StringComparison.Ordinal) ||
+               normalized.StartsWith("o1", StringComparison.Ordinal) ||
+               normalized.StartsWith("o3", StringComparison.Ordinal) ||
+               normalized.StartsWith("o4", StringComparison.Ordinal) ||
+               normalized.StartsWith("codex-", StringComparison.Ordinal);
     }
 
     private static async Task EnsureSuccessAsync(HttpResponseMessage response, CancellationToken cancellationToken)
@@ -161,10 +245,30 @@ public sealed class LmStudioLlmClient(HttpClient httpClient) : ILlmClient
         var body = response.Content is null
             ? null
             : await response.Content.ReadAsStringAsync(cancellationToken);
+        var requestDescription = FormatRequest(response.RequestMessage);
         var message = string.IsNullOrWhiteSpace(body)
-            ? $"OpenAI-compatible request failed with {(int)response.StatusCode} {response.ReasonPhrase}."
-            : $"OpenAI-compatible request failed with {(int)response.StatusCode} {response.ReasonPhrase}: {body}";
+            ? $"HTTP request failed: {requestDescription} returned {(int)response.StatusCode} {response.ReasonPhrase}."
+            : $"HTTP request failed: {requestDescription} returned {(int)response.StatusCode} {response.ReasonPhrase}. Response body: {body}";
+        Trace.WriteLine(message);
         throw new HttpRequestException(message, null, response.StatusCode);
+    }
+
+    private static string BuildTransportErrorMessage(HttpRequestMessage? message, HttpRequestException exception)
+    {
+        var details = string.IsNullOrWhiteSpace(exception.Message)
+            ? exception.InnerException?.Message
+            : exception.Message;
+
+        return string.IsNullOrWhiteSpace(details)
+            ? $"HTTP request failed: {FormatRequest(message)}."
+            : $"HTTP request failed: {FormatRequest(message)}. Error: {details}";
+    }
+
+    private static string FormatRequest(HttpRequestMessage? message)
+    {
+        var method = message?.Method.Method ?? "HTTP";
+        var uri = message?.RequestUri?.ToString() ?? "unknown endpoint";
+        return $"{method} {uri}";
     }
 
     private static bool IsLikelyOpenAiChatModel(string modelId)
@@ -256,15 +360,22 @@ public sealed class LmStudioLlmClient(HttpClient httpClient) : ILlmClient
                 ? BuildOpenAiCompatibleSchema(tool.Parameters)
                 : tool.Parameters.DeepClone();
 
+            var function = new JsonObject
+            {
+                ["name"] = tool.Name,
+                ["description"] = tool.Description,
+                ["parameters"] = parameters,
+            };
+
+            if (provider == LlmProvider.OpenAi)
+            {
+                function["strict"] = true;
+            }
+
             array.Add(new JsonObject
             {
                 ["type"] = "function",
-                ["function"] = new JsonObject
-                {
-                    ["name"] = tool.Name,
-                    ["description"] = tool.Description,
-                    ["parameters"] = parameters,
-                },
+                ["function"] = function,
             });
         }
 
@@ -272,9 +383,9 @@ public sealed class LmStudioLlmClient(HttpClient httpClient) : ILlmClient
     }
 
     private static JsonObject BuildOpenAiCompatibleSchema(JsonObject schema) =>
-        (JsonObject)NormalizeSchemaNode(schema)!;
+        (JsonObject)NormalizeSchemaNodeForOpenAi(schema)!;
 
-    private static JsonNode? NormalizeSchemaNode(JsonNode? node)
+    private static JsonNode? NormalizeSchemaNodeForOpenAi(JsonNode? node)
     {
         switch (node)
         {
@@ -283,15 +394,15 @@ public sealed class LmStudioLlmClient(HttpClient httpClient) : ILlmClient
 
             case JsonObject obj:
             {
+                if (string.Equals(obj["type"]?.GetValue<string>(), "object", StringComparison.OrdinalIgnoreCase))
+                {
+                    return NormalizeObjectSchemaForOpenAi(obj);
+                }
+
                 var clone = new JsonObject();
                 foreach (var property in obj)
                 {
-                    clone[property.Key] = NormalizeSchemaNode(property.Value);
-                }
-
-                if (string.Equals(clone["type"]?.GetValue<string>(), "object", StringComparison.OrdinalIgnoreCase))
-                {
-                    clone["additionalProperties"] = false;
+                    clone[property.Key] = NormalizeSchemaNodeForOpenAi(property.Value);
                 }
 
                 return clone;
@@ -302,7 +413,7 @@ public sealed class LmStudioLlmClient(HttpClient httpClient) : ILlmClient
                 var clone = new JsonArray();
                 foreach (var item in array)
                 {
-                    clone.Add(NormalizeSchemaNode(item));
+                    clone.Add(NormalizeSchemaNodeForOpenAi(item));
                 }
 
                 return clone;
@@ -311,5 +422,71 @@ public sealed class LmStudioLlmClient(HttpClient httpClient) : ILlmClient
             default:
                 return node.DeepClone();
         }
+    }
+
+    private static JsonObject NormalizeObjectSchemaForOpenAi(JsonObject obj)
+    {
+        var clone = new JsonObject
+        {
+            ["type"] = "object",
+            ["additionalProperties"] = false,
+        };
+
+        var properties = obj["properties"]?.AsObject() ?? new JsonObject();
+        var originallyRequired = obj["required"]?.AsArray()
+            .Select(item => item?.GetValue<string>())
+            .Where(name => !string.IsNullOrWhiteSpace(name))
+            .ToHashSet(StringComparer.Ordinal)
+            ?? [];
+
+        var normalizedProperties = new JsonObject();
+        var required = new JsonArray();
+        foreach (var property in properties)
+        {
+            if (property.Value is null)
+            {
+                continue;
+            }
+
+            var normalized = NormalizeSchemaNodeForOpenAi(property.Value);
+            normalizedProperties[property.Key] = originallyRequired.Contains(property.Key)
+                ? normalized
+                : MakeNullableSchema(normalized);
+            required.Add(property.Key);
+        }
+
+        clone["properties"] = normalizedProperties;
+        clone["required"] = required;
+
+        foreach (var property in obj)
+        {
+            if (property.Key is "type" or "properties" or "required" or "additionalProperties")
+            {
+                continue;
+            }
+
+            clone[property.Key] = NormalizeSchemaNodeForOpenAi(property.Value);
+        }
+
+        return clone;
+    }
+
+    private static JsonNode? MakeNullableSchema(JsonNode? schema)
+    {
+        if (schema is JsonObject schemaObject &&
+            schemaObject["anyOf"] is JsonArray anyOf &&
+            anyOf.OfType<JsonObject>().Any(candidate => string.Equals(candidate["type"]?.GetValue<string>(), "null", StringComparison.OrdinalIgnoreCase)))
+        {
+            return schemaObject;
+        }
+
+        return new JsonObject
+        {
+            ["anyOf"] = new JsonArray
+            {
+                schema,
+                new JsonObject { ["type"] = "null" },
+            },
+        };
     }
 }

@@ -12,6 +12,7 @@ public sealed class BrowserSessionManager(AppSettings settings) : IBrowserSessio
 {
     private readonly SemaphoreSlim sessionGate = new(1, 1);
     private readonly Dictionary<Guid, BrowserSessionSnapshot> snapshots = [];
+    private readonly Dictionary<Guid, Dictionary<string, BrowserElementReference>> elementReferences = [];
     private BrowserSession? activeSession;
 
     public async Task<BrowserSessionSnapshot> OpenBrowserAsync(Guid testRunId, string? startUrl, string profilePath, bool headless, CancellationToken cancellationToken)
@@ -64,8 +65,46 @@ public sealed class BrowserSessionManager(AppSettings settings) : IBrowserSessio
         {
             var profileName = GetString(arguments, "profile_name") ?? testRunId.ToString("N");
             var profilePath = Path.Combine(settings.ChromeProfileRoot, profileName);
-            var snapshot = await OpenBrowserAsync(testRunId, GetString(arguments, "url"), profilePath, headless, cancellationToken);
-            return ToolExecutionResult.Successful("Chrome opened.", SnapshotNode(snapshot));
+            var startUrl = GetString(arguments, "url");
+            return await RunLockedAsync(() =>
+            {
+                if (activeSession?.TestRunId == testRunId)
+                {
+                    if (!IsSessionAlive(activeSession))
+                    {
+                        MarkActiveSessionClosedLocked();
+                    }
+                    else
+                    {
+                        var driver = activeSession.Driver;
+                        if (!string.IsNullOrWhiteSpace(startUrl) &&
+                            !string.Equals(SafeGet(() => driver.Url), startUrl, StringComparison.OrdinalIgnoreCase))
+                        {
+                            driver.Navigate().GoToUrl(startUrl);
+                            elementReferences.Remove(testRunId);
+                        }
+
+                        var currentSnapshot = CaptureAndCacheSnapshotLocked(activeSession, RestoreStatus.Active);
+                        return ToolExecutionResult.Successful(
+                            "Chrome already open.",
+                            SnapshotNode(currentSnapshot),
+                            "The active browser session was reused. Continue with page tools; do not call open_browser again unless the browser closes.");
+                    }
+                }
+
+                CloseActiveSessionLocked();
+                var session = CreateSession(testRunId, profilePath, headless);
+                activeSession = session;
+                elementReferences.Remove(testRunId);
+
+                if (!string.IsNullOrWhiteSpace(startUrl))
+                {
+                    session.Driver.Navigate().GoToUrl(startUrl);
+                }
+
+                var snapshot = CaptureAndCacheSnapshotLocked(session, RestoreStatus.Active);
+                return ToolExecutionResult.Successful("Chrome opened.", SnapshotNode(snapshot));
+            }, cancellationToken);
         }
 
         if (toolName == "close_browser")
@@ -103,6 +142,9 @@ public sealed class BrowserSessionManager(AppSettings settings) : IBrowserSessio
                     "get_page_state" => ToolExecutionResult.Successful("Page state captured.", SnapshotNode(CaptureAndCacheSnapshotLocked(session, RestoreStatus.Active))),
                     "find_element" => FindElement(driver, arguments, many: false),
                     "find_elements" => FindElement(driver, arguments, many: true),
+                    "inspect_page" => InspectPage(testRunId, driver, arguments),
+                    "click_ref" => ClickRef(testRunId, driver, arguments),
+                    "type_ref" => TypeRef(testRunId, driver, arguments),
                     "click" => Interact(driver, arguments, element => element.Click(), "Element clicked."),
                     "double_click" => DoubleClick(driver, arguments),
                     "type_text" => TypeText(driver, arguments),
@@ -252,18 +294,204 @@ public sealed class BrowserSessionManager(AppSettings settings) : IBrowserSessio
         if (many)
         {
             var elements = driver.FindElements(GetBy(arguments));
-            return ToolExecutionResult.Successful($"Found {elements.Count} elements.", new JsonArray(elements.Select(DescribeElement).ToArray()));
+            const int maxReturned = 40;
+            return ToolExecutionResult.Successful(
+                $"Found {elements.Count} elements.",
+                new JsonObject
+                {
+                    ["count"] = elements.Count,
+                    ["truncated"] = elements.Count > maxReturned,
+                    ["elements"] = new JsonArray(elements.Take(maxReturned).Select(DescribeElement).ToArray()),
+                },
+                elements.Count > maxReturned ? $"Result capped at {maxReturned} elements. Use inspect_page for compact page refs." : null);
         }
 
         var element = driver.FindElement(GetBy(arguments));
         return ToolExecutionResult.Successful("Element found.", DescribeElement(element));
     }
 
+    private ToolExecutionResult InspectPage(Guid testRunId, IWebDriver driver, JsonObject arguments)
+    {
+        var maxElements = Math.Clamp(arguments["max_elements"]?.GetValue<int>() ?? 40, 1, 100);
+        var includeHidden = arguments["include_hidden"]?.GetValue<bool>() ?? false;
+        var candidates = driver
+            .FindElements(By.CssSelector("a,button,input,textarea,select,[role='button'],[role='link'],[onclick]"))
+            .Where(element => includeHidden || SafeGetBoolean(() => element.Displayed))
+            .Take(maxElements + 1)
+            .ToArray();
+        var returnedCandidates = candidates.Take(maxElements).ToArray();
+
+        var refs = new Dictionary<string, BrowserElementReference>(StringComparer.Ordinal);
+        var elements = new JsonArray();
+        for (var index = 0; index < returnedCandidates.Length; index++)
+        {
+            var element = returnedCandidates[index];
+            var reference = $"e{index + 1}";
+            try
+            {
+                ((IJavaScriptExecutor)driver).ExecuteScript(
+                    "arguments[0].setAttribute('data-browser-testing-ref', arguments[1]);",
+                    element,
+                    reference);
+            }
+            catch
+            {
+                continue;
+            }
+
+            refs[reference] = new BrowserElementReference(reference, $"[data-browser-testing-ref='{reference}']");
+            var description = DescribeElement(element);
+            description["ref"] = reference;
+            description["type"] = Truncate(SafeGet(() => element.GetAttribute("type")), 80);
+            description["aria_label"] = Truncate(SafeGet(() => element.GetAttribute("aria-label")), 160);
+            description["href"] = Truncate(SafeGet(() => element.GetAttribute("href")), 300);
+            description["value"] = Truncate(SafeGet(() => element.GetAttribute("value")), 300);
+            elements.Add(description);
+        }
+
+        elementReferences[testRunId] = refs;
+        return ToolExecutionResult.Successful(
+            "Page inspected.",
+            new JsonObject
+            {
+                ["url"] = Truncate(driver.Url, 500),
+                ["title"] = Truncate(driver.Title, 300),
+                ["count"] = elements.Count,
+                ["truncated"] = candidates.Length > maxElements,
+                ["elements"] = elements,
+            },
+            "Use click_ref or type_ref with one of the returned refs.");
+    }
+
+    private ToolExecutionResult ClickRef(Guid testRunId, IWebDriver driver, JsonObject arguments)
+    {
+        var reference = GetString(arguments, "ref");
+        if (string.IsNullOrWhiteSpace(reference))
+        {
+            return ToolExecutionResult.Failed("A ref is required.", hint: "Call inspect_page first, then pass a returned ref.");
+        }
+
+        return TryGetElementReference(testRunId, reference, out var elementReference)
+            ? InteractByReference(driver, elementReference, element => element.Click(), "Element ref clicked.")
+            : ToolExecutionResult.Failed("Element ref was not found.", hint: "Call inspect_page again and use a returned ref from the current page.");
+    }
+
+    private ToolExecutionResult TypeRef(Guid testRunId, IWebDriver driver, JsonObject arguments)
+    {
+        var reference = GetString(arguments, "ref");
+        var text = GetString(arguments, "text") ?? string.Empty;
+        var clearFirst = arguments["clear_first"]?.GetValue<bool>() ?? true;
+        if (string.IsNullOrWhiteSpace(reference))
+        {
+            return ToolExecutionResult.Failed("A ref is required.", hint: "Call inspect_page first, then pass a returned ref.");
+        }
+
+        return TryGetElementReference(testRunId, reference, out var elementReference)
+            ? InteractByReference(
+                driver,
+                elementReference,
+                element =>
+                {
+                    if (clearFirst)
+                    {
+                        element.Clear();
+                    }
+
+                    element.SendKeys(text);
+                },
+                "Text entered into element ref.",
+                new JsonObject { ["text"] = Truncate(text, 500), ["ref"] = reference })
+            : ToolExecutionResult.Failed("Element ref was not found.", hint: "Call inspect_page again and use a returned ref from the current page.");
+    }
+
+    private bool TryGetElementReference(Guid testRunId, string reference, out BrowserElementReference elementReference)
+    {
+        if (elementReferences.TryGetValue(testRunId, out var refs) &&
+            refs.TryGetValue(reference, out elementReference!))
+        {
+            return true;
+        }
+
+        elementReference = default!;
+        return false;
+    }
+
+    private static ToolExecutionResult InteractByReference(
+        IWebDriver driver,
+        BrowserElementReference elementReference,
+        Action<IWebElement> action,
+        string summary,
+        JsonObject? dataOverride = null)
+    {
+        try
+        {
+            var element = driver.FindElement(By.CssSelector(elementReference.CssSelector));
+            var beforeAction = DescribeElement(element);
+            beforeAction["ref"] = elementReference.Ref;
+            ((IJavaScriptExecutor)driver).ExecuteScript("arguments[0].scrollIntoView({behavior:'instant', block:'center'});", element);
+            action(element);
+            return ToolExecutionResult.Successful(summary, dataOverride ?? beforeAction);
+        }
+        catch (StaleElementReferenceException)
+        {
+            try
+            {
+                var element = driver.FindElement(By.CssSelector(elementReference.CssSelector));
+                var beforeAction = DescribeElement(element);
+                beforeAction["ref"] = elementReference.Ref;
+                ((IJavaScriptExecutor)driver).ExecuteScript("arguments[0].scrollIntoView({behavior:'instant', block:'center'});", element);
+                action(element);
+                return ToolExecutionResult.Successful(summary, dataOverride ?? beforeAction, "Retried after a stale element reference.");
+            }
+            catch (WebDriverException ex)
+            {
+                return ToolExecutionResult.Failed("Element ref could not be used after retry.", Truncate(ex.Message, 1000), hint: "Call inspect_page again and use a current ref.");
+            }
+        }
+        catch (NoSuchElementException)
+        {
+            return ToolExecutionResult.Failed("Element ref is no longer present.", hint: "Call inspect_page again and use a current ref.");
+        }
+    }
+
     private static ToolExecutionResult Interact(IWebDriver driver, JsonObject arguments, Action<IWebElement> action, string summary)
     {
-        var element = driver.FindElement(GetBy(arguments));
-        action(element);
-        return ToolExecutionResult.Successful(summary, DescribeElement(element));
+        var by = GetBy(arguments);
+        try
+        {
+            var element = driver.FindElement(by);
+            var beforeAction = DescribeElement(element);
+            action(element);
+            return ToolExecutionResult.Successful(summary, beforeAction);
+        }
+        catch (StaleElementReferenceException)
+        {
+            try
+            {
+                var element = driver.FindElement(by);
+                var beforeAction = DescribeElement(element);
+                action(element);
+                return ToolExecutionResult.Successful(summary, beforeAction, "Retried after a stale element reference.");
+            }
+            catch (WebDriverException ex)
+            {
+                return ToolExecutionResult.Failed("Element could not be used after stale retry.", Truncate(ex.Message, 1000), hint: "Inspect the current page and use a current ref or selector.");
+            }
+        }
+        catch (NoSuchElementException)
+        {
+            try
+            {
+                var element = driver.FindElement(by);
+                var beforeAction = DescribeElement(element);
+                action(element);
+                return ToolExecutionResult.Successful(summary, beforeAction, "Retried after the first lookup missed.");
+            }
+            catch (WebDriverException ex)
+            {
+                return ToolExecutionResult.Failed("Element was not found after retry.", Truncate(ex.Message, 1000), hint: "Call inspect_page and use click_ref/type_ref, or try a different selector.");
+            }
+        }
     }
 
     private static ToolExecutionResult DoubleClick(IWebDriver driver, JsonObject arguments)
@@ -284,7 +512,11 @@ public sealed class BrowserSessionManager(AppSettings settings) : IBrowserSessio
         }
 
         element.SendKeys(text);
-        return ToolExecutionResult.Successful("Text entered.", new JsonObject { ["text"] = text });
+        return ToolExecutionResult.Successful("Text entered.", new JsonObject
+        {
+            ["text"] = Truncate(text, 500),
+            ["truncated"] = text.Length > 500,
+        });
     }
 
     private static ToolExecutionResult SendKeys(IWebDriver driver, JsonObject arguments)
@@ -292,7 +524,11 @@ public sealed class BrowserSessionManager(AppSettings settings) : IBrowserSessio
         var keys = GetString(arguments, "keys") ?? string.Empty;
         var element = driver.FindElement(GetBy(arguments));
         element.SendKeys(keys);
-        return ToolExecutionResult.Successful("Keys sent.", new JsonObject { ["keys"] = keys });
+        return ToolExecutionResult.Successful("Keys sent.", new JsonObject
+        {
+            ["keys"] = Truncate(keys, 500),
+            ["truncated"] = keys.Length > 500,
+        });
     }
 
     private static ToolExecutionResult SelectOption(IWebDriver driver, JsonObject arguments)
@@ -333,17 +569,28 @@ public sealed class BrowserSessionManager(AppSettings settings) : IBrowserSessio
     private static ToolExecutionResult ReadText(IWebDriver driver, JsonObject arguments)
     {
         var element = driver.FindElement(GetBy(arguments));
-        return ToolExecutionResult.Successful("Element text captured.", new JsonObject { ["text"] = element.Text });
+        var text = element.Text;
+        const int maxLength = 4000;
+        return ToolExecutionResult.Successful("Element text captured.", new JsonObject
+        {
+            ["text"] = Truncate(text, maxLength),
+            ["truncated"] = text.Length > maxLength,
+            ["total_length"] = text.Length,
+        });
     }
 
     private static ToolExecutionResult ReadAttribute(IWebDriver driver, JsonObject arguments)
     {
         var attribute = GetString(arguments, "attribute") ?? "value";
         var element = driver.FindElement(GetBy(arguments));
+        var value = element.GetAttribute(attribute);
+        const int maxLength = 2000;
         return ToolExecutionResult.Successful("Attribute read.", new JsonObject
         {
             ["attribute"] = attribute,
-            ["value"] = element.GetAttribute(attribute),
+            ["value"] = Truncate(value, maxLength),
+            ["truncated"] = (value?.Length ?? 0) > maxLength,
+            ["total_length"] = value?.Length ?? 0,
         });
     }
 
@@ -359,7 +606,16 @@ public sealed class BrowserSessionManager(AppSettings settings) : IBrowserSessio
         }
 
         var html = element?.GetAttribute("outerHTML") ?? driver.PageSource;
-        return ToolExecutionResult.Successful("HTML captured.", new JsonObject { ["html"] = html });
+        const int maxLength = 12000;
+        return ToolExecutionResult.Successful(
+            "HTML captured.",
+            new JsonObject
+            {
+                ["html"] = Truncate(html, maxLength),
+                ["truncated"] = html.Length > maxLength,
+                ["total_length"] = html.Length,
+            },
+            html.Length > maxLength ? "HTML output was capped. Prefer inspect_page for compact actionable refs." : null);
     }
 
     private ToolExecutionResult TakeScreenshot(IWebDriver driver, JsonObject arguments)
@@ -393,7 +649,14 @@ public sealed class BrowserSessionManager(AppSettings settings) : IBrowserSessio
             : [];
 
         var result = js.ExecuteScript(script, args);
-        return ToolExecutionResult.Successful("JavaScript executed.", new JsonObject { ["result"] = result?.ToString() });
+        var resultText = result?.ToString();
+        const int maxLength = 4000;
+        return ToolExecutionResult.Successful("JavaScript executed.", new JsonObject
+        {
+            ["result"] = Truncate(resultText, maxLength),
+            ["truncated"] = (resultText?.Length ?? 0) > maxLength,
+            ["total_length"] = resultText?.Length ?? 0,
+        });
     }
 
     private static async Task<ToolExecutionResult> WaitForElement(IWebDriver driver, JsonObject arguments, CancellationToken cancellationToken)
@@ -427,7 +690,11 @@ public sealed class BrowserSessionManager(AppSettings settings) : IBrowserSessio
             cancellationToken.ThrowIfCancellationRequested();
             if (driver.PageSource.Contains(text, StringComparison.OrdinalIgnoreCase))
             {
-                return ToolExecutionResult.Successful("Text was found on the page.", new JsonObject { ["text"] = text });
+                return ToolExecutionResult.Successful("Text was found on the page.", new JsonObject
+                {
+                    ["text"] = Truncate(text, 500),
+                    ["truncated"] = text.Length > 500,
+                });
             }
 
             await Task.Delay(200, cancellationToken);
@@ -446,7 +713,11 @@ public sealed class BrowserSessionManager(AppSettings settings) : IBrowserSessio
             cancellationToken.ThrowIfCancellationRequested();
             if (driver.Url.Contains(expected, StringComparison.OrdinalIgnoreCase))
             {
-                return ToolExecutionResult.Successful("Navigation condition satisfied.", new JsonObject { ["url"] = driver.Url });
+                return ToolExecutionResult.Successful("Navigation condition satisfied.", new JsonObject
+                {
+                    ["url"] = Truncate(driver.Url, 500),
+                    ["truncated"] = driver.Url.Length > 500,
+                });
             }
 
             await Task.Delay(200, cancellationToken);
@@ -531,13 +802,13 @@ public sealed class BrowserSessionManager(AppSettings settings) : IBrowserSessio
     private static JsonObject DescribeElement(IWebElement element) =>
         new()
         {
-            ["tag"] = element.TagName,
-            ["text"] = element.Text,
-            ["displayed"] = element.Displayed,
-            ["enabled"] = element.Enabled,
-            ["id"] = element.GetAttribute("id"),
-            ["class"] = element.GetAttribute("class"),
-            ["name"] = element.GetAttribute("name"),
+            ["tag"] = Truncate(SafeGet(() => element.TagName), 80),
+            ["text"] = Truncate(SafeGet(() => element.Text), 800),
+            ["displayed"] = SafeGetBoolean(() => element.Displayed),
+            ["enabled"] = SafeGetBoolean(() => element.Enabled),
+            ["id"] = Truncate(SafeGet(() => element.GetAttribute("id")), 120),
+            ["class"] = Truncate(SafeGet(() => element.GetAttribute("class")), 240),
+            ["name"] = Truncate(SafeGet(() => element.GetAttribute("name")), 120),
         };
 
     private static JsonObject SnapshotNode(BrowserSessionSnapshot snapshot)
@@ -548,16 +819,16 @@ public sealed class BrowserSessionManager(AppSettings settings) : IBrowserSessio
             tabs.Add(new JsonObject
             {
                 ["handle"] = tab.Handle,
-                ["title"] = tab.Title,
-                ["url"] = tab.Url,
+                ["title"] = Truncate(tab.Title, 300),
+                ["url"] = Truncate(tab.Url, 500),
                 ["is_selected"] = tab.IsSelected,
             });
         }
 
         return new JsonObject
         {
-            ["current_url"] = snapshot.CurrentUrl,
-            ["page_title"] = snapshot.PageTitle,
+            ["current_url"] = Truncate(snapshot.CurrentUrl, 500),
+            ["page_title"] = Truncate(snapshot.PageTitle, 300),
             ["profile_path"] = snapshot.ProfilePath,
             ["restore_status"] = snapshot.RestoreStatus.ToString(),
             ["tabs"] = tabs,
@@ -757,7 +1028,7 @@ public sealed class BrowserSessionManager(AppSettings settings) : IBrowserSessio
         return ToolExecutionResult.Failed("No active browser session for this run.", "Use `open_browser` to launch Chrome before browser commands.");
     }
 
-    private static string? SafeGet(Func<string> getter)
+    private static string? SafeGet(Func<string?> getter)
     {
         try
         {
@@ -767,6 +1038,28 @@ public sealed class BrowserSessionManager(AppSettings settings) : IBrowserSessio
         {
             return null;
         }
+    }
+
+    private static bool SafeGetBoolean(Func<bool> getter, bool fallback = false)
+    {
+        try
+        {
+            return getter();
+        }
+        catch
+        {
+            return fallback;
+        }
+    }
+
+    private static string? Truncate(string? value, int maxLength)
+    {
+        if (value is null || value.Length <= maxLength)
+        {
+            return value;
+        }
+
+        return value[..maxLength];
     }
 
     private async Task<T> RunLockedAsync<T>(Func<T> action, CancellationToken cancellationToken)
@@ -809,4 +1102,6 @@ public sealed class BrowserSessionManager(AppSettings settings) : IBrowserSessio
     }
 
     private sealed record BrowserSession(Guid TestRunId, string ProfilePath, ChromeDriverService Service, ChromeDriver Driver);
+
+    private sealed record BrowserElementReference(string Ref, string CssSelector);
 }

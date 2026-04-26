@@ -19,6 +19,9 @@ public sealed class ToolRegistry : IToolRegistry
         Define("get_page_state", "Return the current URL, title, and tab summary.", Object()),
         Define("find_element", LocatorDescription("Find the first matching element"), LocatorSchema("locator")),
         Define("find_elements", LocatorDescription("Find all matching elements"), LocatorSchema("locator")),
+        Define("inspect_page", "Return a compact list of visible actionable elements with stable refs for click_ref/type_ref. Use before guessing selectors.", Object(Property("max_elements", "integer"), Property("include_hidden", "boolean"))),
+        Define("click_ref", "Click an element ref returned by inspect_page.", Object(Property("ref", "string", true))),
+        Define("type_ref", "Type text into an element ref returned by inspect_page.", Object(Property("ref", "string", true), Property("text", "string", true), Property("clear_first", "boolean"))),
         Define("click", LocatorDescription("Click an element"), LocatorSchema("locator")),
         Define("double_click", LocatorDescription("Double click an element"), LocatorSchema("locator")),
         Define("type_text", "Type text into an element. Use {\"locator\":{\"strategy\":\"...\",\"value\":\"...\"},\"text\":\"...\"}.", LocatorSchema("locator", Property("text", "string", true), Property("clear_first", "boolean"))),
@@ -30,7 +33,7 @@ public sealed class ToolRegistry : IToolRegistry
         Define("scroll_into_view", LocatorDescription("Scroll until the element is visible"), LocatorSchema("locator")),
         Define("get_text", LocatorDescription("Read text from an element"), LocatorSchema("locator")),
         Define("get_attribute", "Read an attribute from an element. Use {\"locator\":{\"strategy\":\"...\",\"value\":\"...\"},\"attribute\":\"...\"}.", LocatorSchema("locator", Property("attribute", "string", true))),
-        Define("get_html", LocatorDescription("Return outer HTML from an element or the page body"), LocatorSchema("locator")),
+        Define("get_html", "Return bounded outer HTML from an optional element locator, or bounded page HTML when no locator is supplied. Prefer inspect_page for compact actionable refs.", OptionalLocatorSchema("locator")),
         Define("take_screenshot", "Capture a screenshot to disk.", Object(Property("name", "string"))),
         Define("execute_javascript", "Run JavaScript in the current page. Optional arguments must be JSON primitive values passed positionally.", Object(
             Property("script", "string", true),
@@ -48,6 +51,11 @@ public sealed class ToolRegistry : IToolRegistry
         Define("mark_goal_pass", "Mark a goal as passed with evidence.", Object(Property("goal_id", "string", true), Property("evidence", "string", true))),
         Define("mark_goal_fail", "Mark a goal as failed with reason and evidence.", Object(Property("goal_id", "string", true), Property("reason", "string", true), Property("evidence", "string"))),
         Define("list_goals", "List all goals for the active run.", Object()),
+        Define("end_task", "Finish the active run after every goal is passed or failed. Use only when all active-run goals are terminal.", Object(
+            EnumProperty("outcome", ["completed", "failed"], true),
+            Property("summary", "string", true),
+            Property("evidence", "string", true),
+            Property("remaining_work", "string", true))),
         Define("save_secret", "Save a named secret for this chat.", Object(Property("name", "string", true), Property("value", "string", true))),
         Define("get_secret", "Retrieve a named secret for this chat.", Object(Property("name", "string", true))),
         Define("list_secrets", "List saved secret names for this chat.", Object()),
@@ -63,14 +71,20 @@ public sealed class ToolRegistry : IToolRegistry
             Parameters = parameters,
         };
 
-    private static JsonObject LocatorSchema(string locatorName, params JsonObject[] extraProperties)
+    private static JsonObject LocatorSchema(string locatorName, params JsonObject[] extraProperties) =>
+        LocatorSchema(locatorName, locatorRequired: true, extraProperties);
+
+    private static JsonObject OptionalLocatorSchema(string locatorName, params JsonObject[] extraProperties) =>
+        LocatorSchema(locatorName, locatorRequired: false, extraProperties);
+
+    private static JsonObject LocatorSchema(string locatorName, bool locatorRequired, params JsonObject[] extraProperties)
     {
         var allProperties = new List<JsonObject>
         {
             new()
             {
                 ["name"] = locatorName,
-                ["required"] = true,
+                ["required"] = locatorRequired,
                 ["schema"] = new JsonObject
                 {
                     ["type"] = "object",
@@ -135,6 +149,18 @@ public sealed class ToolRegistry : IToolRegistry
             ["schema"] = new JsonObject
             {
                 ["type"] = type,
+            },
+        };
+
+    private static JsonObject EnumProperty(string name, string[] choices, bool required = false) =>
+        new()
+        {
+            ["name"] = name,
+            ["required"] = required,
+            ["schema"] = new JsonObject
+            {
+                ["type"] = "string",
+                ["enum"] = new JsonArray(choices.Select(choice => JsonValue.Create(choice)).ToArray()),
             },
         };
 

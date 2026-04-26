@@ -18,8 +18,18 @@ public sealed class LlmRequest
     public required IReadOnlyList<LlmConversationMessage> Messages { get; init; }
     public required IReadOnlyList<LlmToolDefinition> Tools { get; init; }
     public bool Stream { get; init; } = true;
+    public LlmToolChoiceMode ToolChoiceMode { get; init; } = LlmToolChoiceMode.Auto;
+    public string? ForcedToolName { get; init; }
+    public bool ParallelToolCalls { get; init; }
     public string Model => Connection.Model;
     public double Temperature => Connection.Temperature;
+}
+
+public enum LlmToolChoiceMode
+{
+    Auto = 0,
+    Required = 1,
+    ForceFunction = 2,
 }
 
 public sealed class LlmConversationMessage

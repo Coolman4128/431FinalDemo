@@ -107,6 +107,22 @@ public static class ToolArgumentValidator
             return;
         }
 
+        if (schema["enum"] is JsonArray choices && choices.Count > 0 && value is JsonValue enumValue)
+        {
+            var allowed = choices
+                .Select(choice => choice?.GetValue<string>())
+                .Where(choice => !string.IsNullOrWhiteSpace(choice))
+                .ToArray();
+            if (enumValue.TryGetValue<string>(out var text) &&
+                allowed.Any(choice => string.Equals(choice, text, StringComparison.Ordinal)))
+            {
+                return;
+            }
+
+            issues.Add($"Argument `{path}` must be one of: {string.Join(", ", allowed)}.");
+            return;
+        }
+
         if (value is null)
         {
             if (string.Equals(type, "null", StringComparison.OrdinalIgnoreCase))
@@ -186,7 +202,11 @@ public static class ToolArgumentValidator
                 break;
 
             case "null":
-                issues.Add($"Argument `{path}` must be null.");
+                if (value is not null)
+                {
+                    issues.Add($"Argument `{path}` must be null.");
+                }
+
                 break;
         }
     }
