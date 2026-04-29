@@ -309,7 +309,9 @@ public static class ToolArgumentValidator
             "value" => "selector-or-value",
             "strategy" => "css",
             "reason" => "Observed behavior did not meet the goal",
+            "summary" => "I created the active-run goals, drove the browser through the requested workflow, inspected the resulting page state, and recorded evidence against each goal before ending the run.",
             "evidence" => "Captured page evidence",
+            "test_results" => "All requested test goals passed. Each active-run goal was marked with observed browser evidence, and no unresolved pending or running goals remained when the run was ended.",
             "attribute" => "aria-label",
             _ => $"<{propertyName}>",
         };

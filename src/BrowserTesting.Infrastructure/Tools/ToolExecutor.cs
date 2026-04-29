@@ -12,6 +12,8 @@ public sealed class ToolExecutor(
     ISecretStore secretStore,
     IToolRegistry toolRegistry) : IToolExecutor
 {
+    private const int MinimumEndTaskNarrativeLength = 120;
+
     private static readonly HashSet<string> LocatorToolNames =
     [
         "find_element",
@@ -138,6 +140,31 @@ public sealed class ToolExecutor(
             return ToolExecutionResult.Failed("Status must be pending, running, passed, or failed.");
         }
 
+        var goals = await goalService.ListGoalsAsync(context.TestRunId, cancellationToken);
+        var existingGoal = goals.SingleOrDefault(candidate => candidate.Id == goalId);
+        if (existingGoal is null)
+        {
+            return ToolExecutionResult.Failed("Goal not found.");
+        }
+
+        if (existingGoal.Status is GoalStatus.Passed or GoalStatus.Failed)
+        {
+            var unresolved = goals
+                .Where(goal => goal.Status is GoalStatus.Pending or GoalStatus.Running)
+                .ToArray();
+
+            return ToolExecutionResult.Failed(
+                $"Goal is already {existingGoal.Status}; it was not changed.",
+                data: new JsonObject
+                {
+                    ["goal"] = GoalNode(existingGoal),
+                    ["unresolved_goals"] = new JsonArray(unresolved.Select(GoalNode).ToArray()),
+                },
+                hint: unresolved.Length == 0
+                    ? "All goals are already terminal. Call end_task instead of marking the same goal again."
+                    : "Use a Pending or Running goal_id from active_run.goals. Do not mark an already terminal goal again.");
+        }
+
         var goal = await goalService.UpdateGoalStatusAsync(
             context.ChatSessionId,
             context.TestRunId,
@@ -161,9 +188,10 @@ public sealed class ToolExecutor(
     private async Task<ToolExecutionResult> EndTaskAsync(ToolInvocationContext context, JsonObject arguments, CancellationToken cancellationToken)
     {
         var outcome = GetString(arguments, "outcome");
-        var summary = GetString(arguments, "summary");
-        var evidence = GetString(arguments, "evidence");
-        var remainingWork = GetString(arguments, "remaining_work");
+        var summary = GetString(arguments, "summary")?.Trim();
+        var testResults = GetString(arguments, "test_results")?.Trim();
+        var evidence = GetString(arguments, "evidence")?.Trim();
+        var remainingWork = GetString(arguments, "remaining_work")?.Trim();
 
         if (outcome is not ("completed" or "failed"))
         {
@@ -171,10 +199,18 @@ public sealed class ToolExecutor(
         }
 
         if (string.IsNullOrWhiteSpace(summary) ||
+            string.IsNullOrWhiteSpace(testResults) ||
             string.IsNullOrWhiteSpace(evidence) ||
             string.IsNullOrWhiteSpace(remainingWork))
         {
-            return ToolExecutionResult.Failed("End task summary, evidence, and remaining_work are required.");
+            return ToolExecutionResult.Failed("End task summary, test_results, evidence, and remaining_work are required.");
+        }
+
+        if (summary.Length < MinimumEndTaskNarrativeLength ||
+            testResults.Length < MinimumEndTaskNarrativeLength)
+        {
+            return ToolExecutionResult.Failed(
+                $"End task summary and test_results must each be paragraph-length text of at least {MinimumEndTaskNarrativeLength} characters.");
         }
 
         var goals = await goalService.ListGoalsAsync(context.TestRunId, cancellationToken);
@@ -202,9 +238,10 @@ public sealed class ToolExecutor(
             new JsonObject
             {
                 ["outcome"] = hasFailedGoal ? "failed" : outcome,
-                ["summary"] = summary.Trim(),
-                ["evidence"] = evidence.Trim(),
-                ["remaining_work"] = remainingWork.Trim(),
+                ["summary"] = summary,
+                ["test_results"] = testResults,
+                ["evidence"] = evidence,
+                ["remaining_work"] = remainingWork,
                 ["goals"] = new JsonArray(goals.Select(GoalNode).ToArray()),
             });
     }

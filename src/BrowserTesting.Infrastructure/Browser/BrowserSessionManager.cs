@@ -131,7 +131,8 @@ public sealed class BrowserSessionManager(AppSettings settings) : IBrowserSessio
 
             try
             {
-                return toolName switch
+                var beforeUrl = SafeGet(() => driver.Url);
+                var result = toolName switch
                 {
                     "list_tabs" => ToolExecutionResult.Successful("Tabs listed.", SnapshotNode(CaptureAndCacheSnapshotLocked(session, RestoreStatus.Active))),
                     "switch_tab" => SwitchTab(driver, arguments),
@@ -173,6 +174,8 @@ public sealed class BrowserSessionManager(AppSettings settings) : IBrowserSessio
                     }),
                     _ => await ExecuteAsyncTool(driver, toolName, arguments, cancellationToken),
                 };
+
+                return FinalizeBrowserToolResult(testRunId, toolName, beforeUrl, driver, result);
             }
             catch (Exception ex) when (IsClosedBrowserException(ex))
             {
@@ -339,7 +342,7 @@ public sealed class BrowserSessionManager(AppSettings settings) : IBrowserSessio
                 continue;
             }
 
-            refs[reference] = new BrowserElementReference(reference, $"[data-browser-testing-ref='{reference}']");
+            refs[reference] = new BrowserElementReference(reference, $"[data-browser-testing-ref='{reference}']", driver.Url);
             var description = DescribeElement(element);
             description["ref"] = reference;
             description["type"] = Truncate(SafeGet(() => element.GetAttribute("type")), 80);
@@ -356,6 +359,7 @@ public sealed class BrowserSessionManager(AppSettings settings) : IBrowserSessio
             {
                 ["url"] = Truncate(driver.Url, 500),
                 ["title"] = Truncate(driver.Title, 300),
+                ["visible_text"] = Truncate(SafeGet(() => driver.FindElement(By.TagName("body")).Text), 4000),
                 ["count"] = elements.Count,
                 ["truncated"] = candidates.Length > maxElements,
                 ["elements"] = elements,
@@ -371,9 +375,17 @@ public sealed class BrowserSessionManager(AppSettings settings) : IBrowserSessio
             return ToolExecutionResult.Failed("A ref is required.", hint: "Call inspect_page first, then pass a returned ref.");
         }
 
-        return TryGetElementReference(testRunId, reference, out var elementReference)
-            ? InteractByReference(driver, elementReference, element => element.Click(), "Element ref clicked.")
-            : ToolExecutionResult.Failed("Element ref was not found.", hint: "Call inspect_page again and use a returned ref from the current page.");
+        if (!TryGetElementReference(testRunId, reference, out var elementReference))
+        {
+            return ToolExecutionResult.Failed("Element ref was not found.", hint: "Call inspect_page again and use a returned ref from the current page.");
+        }
+
+        if (!IsReferenceForCurrentPage(driver, elementReference))
+        {
+            return CreatePreviousPageRefResult(driver, elementReference);
+        }
+
+        return InteractByReference(driver, elementReference, element => element.Click(), "Element ref clicked.");
     }
 
     private ToolExecutionResult TypeRef(Guid testRunId, IWebDriver driver, JsonObject arguments)
@@ -386,22 +398,30 @@ public sealed class BrowserSessionManager(AppSettings settings) : IBrowserSessio
             return ToolExecutionResult.Failed("A ref is required.", hint: "Call inspect_page first, then pass a returned ref.");
         }
 
-        return TryGetElementReference(testRunId, reference, out var elementReference)
-            ? InteractByReference(
-                driver,
-                elementReference,
-                element =>
-                {
-                    if (clearFirst)
-                    {
-                        element.Clear();
-                    }
+        if (!TryGetElementReference(testRunId, reference, out var elementReference))
+        {
+            return ToolExecutionResult.Failed("Element ref was not found.", hint: "Call inspect_page again and use a returned ref from the current page.");
+        }
 
-                    element.SendKeys(text);
-                },
-                "Text entered into element ref.",
-                new JsonObject { ["text"] = Truncate(text, 500), ["ref"] = reference })
-            : ToolExecutionResult.Failed("Element ref was not found.", hint: "Call inspect_page again and use a returned ref from the current page.");
+        if (!IsReferenceForCurrentPage(driver, elementReference))
+        {
+            return CreatePreviousPageRefResult(driver, elementReference);
+        }
+
+        return InteractByReference(
+            driver,
+            elementReference,
+            element =>
+            {
+                if (clearFirst)
+                {
+                    element.Clear();
+                }
+
+                element.SendKeys(text);
+            },
+            "Text entered into element ref.",
+            new JsonObject { ["text"] = Truncate(text, 500), ["ref"] = reference });
     }
 
     private bool TryGetElementReference(Guid testRunId, string reference, out BrowserElementReference elementReference)
@@ -415,6 +435,76 @@ public sealed class BrowserSessionManager(AppSettings settings) : IBrowserSessio
         elementReference = default!;
         return false;
     }
+
+    private ToolExecutionResult FinalizeBrowserToolResult(
+        Guid testRunId,
+        string toolName,
+        string? beforeUrl,
+        IWebDriver driver,
+        ToolExecutionResult result)
+    {
+        if (!result.Success)
+        {
+            return result;
+        }
+
+        var afterUrl = SafeGet(() => driver.Url);
+        if (!ShouldInvalidateRefsAfterTool(toolName, beforeUrl, afterUrl))
+        {
+            return result;
+        }
+
+        elementReferences.Remove(testRunId);
+        var data = EnsureObjectData(result);
+        data["before_url"] = Truncate(beforeUrl, 500);
+        data["current_url"] = Truncate(afterUrl, 500);
+        data["refs_invalidated"] = true;
+
+        AppendHint(result, "Page context changed; refs from earlier inspect_page results are now invalid. Call inspect_page before using click_ref or type_ref again.");
+        return result;
+    }
+
+    private static bool ShouldInvalidateRefsAfterTool(string toolName, string? beforeUrl, string? afterUrl) =>
+        toolName is "goto_url" or "back" or "forward" or "refresh" or "switch_tab"
+        || !IsSamePageUrl(beforeUrl, afterUrl);
+
+    private static JsonObject EnsureObjectData(ToolExecutionResult result)
+    {
+        if (result.Data is JsonObject data)
+        {
+            return data;
+        }
+
+        var replacement = new JsonObject();
+        if (result.Data is not null)
+        {
+            replacement["result"] = result.Data.DeepClone();
+        }
+
+        result.Data = replacement;
+        return replacement;
+    }
+
+    private static void AppendHint(ToolExecutionResult result, string hint)
+    {
+        result.Hint = string.IsNullOrWhiteSpace(result.Hint)
+            ? hint
+            : $"{result.Hint} {hint}";
+    }
+
+    private static bool IsReferenceForCurrentPage(IWebDriver driver, BrowserElementReference elementReference) =>
+        IsSamePageUrl(elementReference.PageUrl, SafeGet(() => driver.Url));
+
+    private static ToolExecutionResult CreatePreviousPageRefResult(IWebDriver driver, BrowserElementReference elementReference) =>
+        ToolExecutionResult.Failed(
+            "Element ref belongs to a previous page.",
+            data: new JsonObject
+            {
+                ["ref"] = elementReference.Ref,
+                ["inspected_url"] = Truncate(elementReference.PageUrl, 500),
+                ["current_url"] = Truncate(SafeGet(() => driver.Url), 500),
+            },
+            hint: "Use refs only from the latest inspect_page result for the current URL. Call inspect_page on the current page before click_ref or type_ref.");
 
     private static ToolExecutionResult InteractByReference(
         IWebDriver driver,
@@ -930,6 +1020,35 @@ public sealed class BrowserSessionManager(AppSettings settings) : IBrowserSessio
             message.Contains("chrome not reachable", StringComparison.OrdinalIgnoreCase) ||
             message.Contains("disconnected", StringComparison.OrdinalIgnoreCase));
 
+    private static bool IsSamePageUrl(string? left, string? right)
+    {
+        var normalizedLeft = NormalizePageUrl(left);
+        var normalizedRight = NormalizePageUrl(right);
+        return !string.IsNullOrWhiteSpace(normalizedLeft) &&
+               !string.IsNullOrWhiteSpace(normalizedRight) &&
+               string.Equals(normalizedLeft, normalizedRight, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string? NormalizePageUrl(string? url)
+    {
+        if (string.IsNullOrWhiteSpace(url))
+        {
+            return null;
+        }
+
+        if (!Uri.TryCreate(url, UriKind.Absolute, out var uri))
+        {
+            var hashIndex = url.IndexOf('#', StringComparison.Ordinal);
+            return (hashIndex >= 0 ? url[..hashIndex] : url).TrimEnd('/');
+        }
+
+        var builder = new UriBuilder(uri)
+        {
+            Fragment = string.Empty,
+        };
+        return builder.Uri.AbsoluteUri.TrimEnd('/');
+    }
+
     private static BrowserSessionSnapshot CaptureSnapshot(BrowserSession session, RestoreStatus restoreStatus)
     {
         var driver = session.Driver;
@@ -1103,5 +1222,5 @@ public sealed class BrowserSessionManager(AppSettings settings) : IBrowserSessio
 
     private sealed record BrowserSession(Guid TestRunId, string ProfilePath, ChromeDriverService Service, ChromeDriver Driver);
 
-    private sealed record BrowserElementReference(string Ref, string CssSelector);
+    private sealed record BrowserElementReference(string Ref, string CssSelector, string PageUrl);
 }

@@ -19,9 +19,9 @@ public sealed class ToolRegistry : IToolRegistry
         Define("get_page_state", "Return the current URL, title, and tab summary.", Object()),
         Define("find_element", LocatorDescription("Find the first matching element"), LocatorSchema("locator")),
         Define("find_elements", LocatorDescription("Find all matching elements"), LocatorSchema("locator")),
-        Define("inspect_page", "Return a compact list of visible actionable elements with stable refs for click_ref/type_ref. Use before guessing selectors.", Object(Property("max_elements", "integer"), Property("include_hidden", "boolean"))),
-        Define("click_ref", "Click an element ref returned by inspect_page.", Object(Property("ref", "string", true))),
-        Define("type_ref", "Type text into an element ref returned by inspect_page.", Object(Property("ref", "string", true), Property("text", "string", true), Property("clear_first", "boolean"))),
+        Define("inspect_page", "Return visible page text plus a compact list of visible actionable elements with page-local refs for click_ref/type_ref. Use before guessing selectors.", Object(Property("max_elements", "integer"), Property("include_hidden", "boolean"))),
+        Define("click_ref", "Click an element ref returned by the latest inspect_page for the current page URL.", Object(Property("ref", "string", true))),
+        Define("type_ref", "Type text into an element ref returned by the latest inspect_page for the current page URL.", Object(Property("ref", "string", true), Property("text", "string", true), Property("clear_first", "boolean"))),
         Define("click", LocatorDescription("Click an element"), LocatorSchema("locator")),
         Define("double_click", LocatorDescription("Double click an element"), LocatorSchema("locator")),
         Define("type_text", "Type text into an element. Use {\"locator\":{\"strategy\":\"...\",\"value\":\"...\"},\"text\":\"...\"}.", LocatorSchema("locator", Property("text", "string", true), Property("clear_first", "boolean"))),
@@ -51,9 +51,10 @@ public sealed class ToolRegistry : IToolRegistry
         Define("mark_goal_pass", "Mark a goal as passed with evidence.", Object(Property("goal_id", "string", true), Property("evidence", "string", true))),
         Define("mark_goal_fail", "Mark a goal as failed with reason and evidence.", Object(Property("goal_id", "string", true), Property("reason", "string", true), Property("evidence", "string"))),
         Define("list_goals", "List all goals for the active run.", Object()),
-        Define("end_task", "Finish the active run after every goal is passed or failed. Use only when all active-run goals are terminal.", Object(
+        Define("end_task", "Finish the active run after every goal is passed or failed. Include final text summarizing what was done and the test results. Use only when all active-run goals are terminal.", Object(
             EnumProperty("outcome", ["completed", "failed"], true),
-            Property("summary", "string", true),
+            Property("summary", "string", true, "One or two paragraphs, at least 120 characters, summarizing what you did during the run. Do not use a terse phrase."),
+            Property("test_results", "string", true, "One or two paragraphs, at least 120 characters, summarizing which tests or goals passed or failed and why. Do not use a terse phrase."),
             Property("evidence", "string", true),
             Property("remaining_work", "string", true))),
         Define("save_secret", "Save a named secret for this chat.", Object(Property("name", "string", true), Property("value", "string", true))),
@@ -141,16 +142,25 @@ public sealed class ToolRegistry : IToolRegistry
         return schema;
     }
 
-    private static JsonObject Property(string name, string type, bool required = false) =>
-        new()
+    private static JsonObject Property(string name, string type, bool required = false, string? description = null)
+    {
+        var schema = new JsonObject
+        {
+            ["type"] = type,
+        };
+
+        if (!string.IsNullOrWhiteSpace(description))
+        {
+            schema["description"] = description;
+        }
+
+        return new JsonObject
         {
             ["name"] = name,
             ["required"] = required,
-            ["schema"] = new JsonObject
-            {
-                ["type"] = type,
-            },
+            ["schema"] = schema,
         };
+    }
 
     private static JsonObject EnumProperty(string name, string[] choices, bool required = false) =>
         new()

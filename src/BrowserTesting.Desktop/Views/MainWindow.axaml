@@ -51,7 +51,7 @@
                 MaxWidth="680">
           <StackPanel Spacing="10">
             <DockPanel LastChildFill="False">
-              <TextBlock Text="{Binding ToolName}" FontWeight="SemiBold" />
+              <TextBlock Text="{Binding DisplayTitle}" FontWeight="SemiBold" />
               <TextBlock DockPanel.Dock="Right"
                          Text="{Binding Timestamp}"
                          Classes="caption" />
@@ -68,6 +68,23 @@
                        FontWeight="SemiBold"
                        Foreground="{Binding StatusBrush}"
                        IsVisible="{Binding IsCompleted}" />
+
+            <StackPanel Spacing="10" IsVisible="{Binding HasFinalReport}">
+              <StackPanel Spacing="4" IsVisible="{Binding HasFinalSummary}">
+                <TextBlock Text="Summary" Classes="sectionLabel" />
+                <SelectableTextBlock Text="{Binding FinalSummary}" TextWrapping="Wrap" />
+              </StackPanel>
+
+              <StackPanel Spacing="4" IsVisible="{Binding HasFinalTestResults}">
+                <TextBlock Text="Test Results" Classes="sectionLabel" />
+                <SelectableTextBlock Text="{Binding FinalTestResults}" TextWrapping="Wrap" />
+              </StackPanel>
+
+              <StackPanel Spacing="4" IsVisible="{Binding HasFinalRemainingWork}">
+                <TextBlock Text="Remaining Work" Classes="sectionLabel" />
+                <SelectableTextBlock Text="{Binding FinalRemainingWork}" TextWrapping="Wrap" />
+              </StackPanel>
+            </StackPanel>
           </StackPanel>
         </Border>
       </Grid>

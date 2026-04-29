@@ -125,12 +125,23 @@ public sealed class ToolTimelineItemViewModel(TimelineEntry entry)
     private string toolName = entry.ToolName ?? "tool";
     private bool isRunning = entry.Kind == TimelineItemKind.ToolCallStarted;
     private bool success = entry.Kind != TimelineItemKind.ToolCallFinished || ReadSuccess(entry.MetadataJson);
+    private string? finalSummary = ReadEndTaskValue(entry.ToolName, entry.MetadataJson, "summary");
+    private string? finalTestResults = ReadEndTaskValue(entry.ToolName, entry.MetadataJson, "test_results");
+    private string? finalRemainingWork = ReadEndTaskValue(entry.ToolName, entry.MetadataJson, "remaining_work");
 
     public string ToolName
     {
         get => toolName;
-        private set => SetProperty(ref toolName, value);
+        private set
+        {
+            if (SetProperty(ref toolName, value))
+            {
+                RaisePropertyChanged(nameof(DisplayTitle));
+            }
+        }
     }
+
+    public string DisplayTitle => HasFinalReport ? "Run Summary" : ToolName;
 
     public bool IsRunning
     {
@@ -169,11 +180,64 @@ public sealed class ToolTimelineItemViewModel(TimelineEntry entry)
             ? Brushes.MediumSeaGreen
             : Brushes.IndianRed;
 
+    public string? FinalSummary
+    {
+        get => finalSummary;
+        private set
+        {
+            if (SetProperty(ref finalSummary, value))
+            {
+                RaiseFinalReportPropertiesChanged();
+            }
+        }
+    }
+
+    public string? FinalTestResults
+    {
+        get => finalTestResults;
+        private set
+        {
+            if (SetProperty(ref finalTestResults, value))
+            {
+                RaiseFinalReportPropertiesChanged();
+            }
+        }
+    }
+
+    public string? FinalRemainingWork
+    {
+        get => finalRemainingWork;
+        private set
+        {
+            if (SetProperty(ref finalRemainingWork, value))
+            {
+                RaiseFinalReportPropertiesChanged();
+            }
+        }
+    }
+
+    public bool HasFinalSummary => !string.IsNullOrWhiteSpace(FinalSummary);
+    public bool HasFinalTestResults => !string.IsNullOrWhiteSpace(FinalTestResults);
+    public bool HasFinalRemainingWork => !string.IsNullOrWhiteSpace(FinalRemainingWork);
+    public bool HasFinalReport => HasFinalSummary || HasFinalTestResults || HasFinalRemainingWork;
+
     public void ApplyFinishedEntry(TimelineEntry entry)
     {
         ToolName = entry.ToolName ?? ToolName;
         Success = ReadSuccess(entry.MetadataJson);
+        FinalSummary = ReadEndTaskValue(entry.ToolName, entry.MetadataJson, "summary");
+        FinalTestResults = ReadEndTaskValue(entry.ToolName, entry.MetadataJson, "test_results");
+        FinalRemainingWork = ReadEndTaskValue(entry.ToolName, entry.MetadataJson, "remaining_work");
         IsRunning = false;
+    }
+
+    private void RaiseFinalReportPropertiesChanged()
+    {
+        RaisePropertyChanged(nameof(HasFinalSummary));
+        RaisePropertyChanged(nameof(HasFinalTestResults));
+        RaisePropertyChanged(nameof(HasFinalRemainingWork));
+        RaisePropertyChanged(nameof(HasFinalReport));
+        RaisePropertyChanged(nameof(DisplayTitle));
     }
 
     private static bool ReadSuccess(string? metadataJson)
@@ -194,6 +258,33 @@ public sealed class ToolTimelineItemViewModel(TimelineEntry entry)
         {
             return !metadataJson.Contains(@"""success"":false", StringComparison.OrdinalIgnoreCase)
                 && !metadataJson.Contains(@"""Success"":false", StringComparison.OrdinalIgnoreCase);
+        }
+    }
+
+    private static string? ReadEndTaskValue(string? toolName, string? metadataJson, string propertyName)
+    {
+        if (!string.Equals(toolName, "end_task", StringComparison.Ordinal) ||
+            string.IsNullOrWhiteSpace(metadataJson))
+        {
+            return null;
+        }
+
+        try
+        {
+            var metadata = JsonNode.Parse(metadataJson)?.AsObject();
+            if (metadata?["data"] is not JsonObject data ||
+                data[propertyName] is not JsonValue value ||
+                !value.TryGetValue<string>(out var text) ||
+                string.IsNullOrWhiteSpace(text))
+            {
+                return null;
+            }
+
+            return text.Trim();
+        }
+        catch
+        {
+            return null;
         }
     }
 }

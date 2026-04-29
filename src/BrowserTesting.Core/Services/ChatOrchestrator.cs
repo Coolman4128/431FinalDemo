@@ -507,10 +507,15 @@ public sealed class ChatOrchestrator(
         builder.AppendLine("- Only use goal IDs from active_run.goals. Previous-run summaries are not actionable.");
         builder.AppendLine("- Do not call open_browser when active_run.browser.restore_status is Active; continue from the current page.");
         builder.AppendLine("- After inspect_page returns usable refs, act on those refs. Do not inspect the same unchanged page repeatedly.");
+        builder.AppendLine("- Refs are page-local. If the current URL differs from the inspection URL, inspect the current page before click_ref/type_ref.");
+        builder.AppendLine("- When observed evidence satisfies a pending goal, mark that goal passed immediately before moving to later dependent work.");
+        builder.AppendLine("- Use active_run.last_page_inspection and active_run.recent_page_inspections as valid evidence from this run. Do not fail a goal only because the browser later advanced to another page.");
+        builder.AppendLine("- Do not mark an already Passed or Failed goal again. Use a Pending or Running goal ID, or call end_task when all goals are terminal.");
         builder.AppendLine("- Resolve every active-run goal as passed or failed with observed evidence.");
         builder.AppendLine("- When every active-run goal is passed or failed, call end_task next.");
         builder.AppendLine("- If end_task fails, resolve the returned unresolved goals, then call end_task again.");
         builder.AppendLine("- Prefer inspect_page, then click_ref/type_ref. Use selector tools only when refs are insufficient.");
+        builder.AppendLine("- inspect_page lists actionable elements and visible_text. For cost, totals, confirmation text, and other non-control content, inspect_page visible_text or get_text/get_html must show the expected text before passing the goal.");
         builder.AppendLine("- On tool failure, change strategy. Do not repeat identical failing calls.");
         builder.AppendLine();
         builder.AppendLine("Critical shapes:");
@@ -519,7 +524,7 @@ public sealed class ChatOrchestrator(
         builder.AppendLine("- Locator tools: {\"locator\":{\"strategy\":\"css\",\"value\":\"input[name='q']\"}}");
         builder.AppendLine("- mark_goal_pass: {\"goal_id\":\"<goal-id>\",\"evidence\":\"Observed expected result on the page.\"}");
         builder.AppendLine("- mark_goal_fail: {\"goal_id\":\"<goal-id>\",\"reason\":\"Why the goal failed.\",\"evidence\":\"Observed blocking evidence.\"}");
-        builder.AppendLine("- end_task: {\"outcome\":\"completed|failed\",\"summary\":\"...\",\"evidence\":\"...\",\"remaining_work\":\"none|...\"}");
+        builder.AppendLine("- end_task: {\"outcome\":\"completed|failed\",\"summary\":\"One or two paragraphs, at least 120 characters, summarizing what you did.\",\"test_results\":\"One or two paragraphs, at least 120 characters, summarizing pass/fail results.\",\"evidence\":\"...\",\"remaining_work\":\"none|...\"}");
         builder.AppendLine();
         builder.AppendLine("active_run:");
         builder.AppendLine(BuildActiveRunContext(chat, activeRun, turnsRemaining).ToJsonString());
@@ -550,6 +555,7 @@ public sealed class ChatOrchestrator(
             ["saved_secret_names"] = secrets,
             ["recent_tool_outcomes"] = GetRecentToolOutcomes(chat, activeRun.Id),
             ["last_page_inspection"] = GetLastPageInspection(chat, activeRun.Id),
+            ["recent_page_inspections"] = GetRecentPageInspections(chat, activeRun.Id),
             ["previous_runs_summary"] = BuildPreviousRunSummary(chat, activeRun.Id),
         };
     }
@@ -1222,7 +1228,7 @@ public sealed class ChatOrchestrator(
 
         if (CanCallEndTask(run))
         {
-            return prefix + "All active-run goals are passed or failed. Call end_task now with summary, evidence, and remaining_work.";
+            return prefix + "All active-run goals are passed or failed. Call end_task now with paragraph-length summary, paragraph-length test_results, evidence, and remaining_work.";
         }
 
         if (run.Goals.Count == 0)
@@ -1238,7 +1244,7 @@ public sealed class ChatOrchestrator(
     }
 
     private static string BuildPassiveToolLoopNotice(string toolName, int attemptCount) =>
-        $"Passive tool loop detected after {attemptCount} consecutive passive calls ending with `{toolName}`. Use active_run.goals, active_run.browser, and active_run.last_page_inspection from context instead of calling list_goals/open_browser/inspect_page again. The next tool should change page or goal state: create a missing distinct goal, type_ref, click_ref, mark_goal_pass, mark_goal_fail, or end_task when all goals are terminal.";
+        $"Passive tool loop detected after {attemptCount} consecutive passive calls ending with `{toolName}`. Use active_run.goals, active_run.browser, active_run.last_page_inspection, and active_run.recent_page_inspections from context instead of calling list_goals/open_browser/inspect_page again. The next tool should change page or goal state: create a missing distinct goal, type_ref, click_ref, mark_goal_pass, mark_goal_fail, or end_task when all goals are terminal.";
 
     private static JsonNode CoerceTaggedValue(string rawValue)
     {
@@ -1307,7 +1313,15 @@ public sealed class ChatOrchestrator(
             builder.Append($"Example arguments: {CompactJsonNode(result.ExampleArguments, 1000)?.ToJsonString()}. ");
         }
 
-        builder.Append("Next-step options: inspect page state, change the argument shape, try a different locator strategy, use a less brittle inspection tool, or fail the goal with evidence if the page blocks further progress.");
+        if (toolName is "mark_goal_pass" or "mark_goal_fail" or "update_goal_status")
+        {
+            builder.Append("Next-step options: use a Pending or Running goal ID from active_run.goals, inspect prior active-run evidence if needed, or call end_task if every goal is already terminal.");
+        }
+        else
+        {
+            builder.Append("Next-step options: inspect page state, change the argument shape, try a different locator strategy, use a less brittle inspection tool, or fail the goal with evidence if the page blocks further progress.");
+        }
+
         return builder.ToString();
     }
 
@@ -1457,6 +1471,68 @@ public sealed class ChatOrchestrator(
         return CompactJsonNode(metadata?["data"], 700, 30, 80);
     }
 
+    private static JsonArray GetRecentPageInspections(ChatSession chat, Guid runId)
+    {
+        const int maxInspections = 5;
+        var inspections = new List<JsonNode>();
+        var seenUrls = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var entry in chat.Timeline
+                     .Where(candidate =>
+                         candidate.TestRunId == runId &&
+                         candidate.Kind == TimelineItemKind.ToolCallFinished &&
+                         string.Equals(candidate.ToolName, "inspect_page", StringComparison.Ordinal))
+                     .OrderByDescending(candidate => candidate.Sequence))
+        {
+            var metadata = ParseMetadata(entry.MetadataJson);
+            if (metadata?["success"]?.GetValue<bool>() != true ||
+                metadata["data"] is not JsonObject data)
+            {
+                continue;
+            }
+
+            var url = data["url"]?.GetValue<string>();
+            var urlKey = NormalizePageEvidenceUrl(url) ?? entry.Sequence.ToString();
+            if (!seenUrls.Add(urlKey))
+            {
+                continue;
+            }
+
+            if (CompactJsonNode(data, 900, 30, 80) is { } compact)
+            {
+                inspections.Add(compact);
+            }
+
+            if (inspections.Count >= maxInspections)
+            {
+                break;
+            }
+        }
+
+        inspections.Reverse();
+        return new JsonArray(inspections.ToArray());
+    }
+
+    private static string? NormalizePageEvidenceUrl(string? url)
+    {
+        if (string.IsNullOrWhiteSpace(url))
+        {
+            return null;
+        }
+
+        if (!Uri.TryCreate(url, UriKind.Absolute, out var uri))
+        {
+            var hashIndex = url.IndexOf('#', StringComparison.Ordinal);
+            return (hashIndex >= 0 ? url[..hashIndex] : url).TrimEnd('/');
+        }
+
+        var builder = new UriBuilder(uri)
+        {
+            Fragment = string.Empty,
+        };
+        return builder.Uri.AbsoluteUri.TrimEnd('/');
+    }
+
     private static bool ShouldIncludeRecentToolData(string? toolName) =>
         toolName is "inspect_page"
             or "find_element"
@@ -1470,7 +1546,11 @@ public sealed class ChatOrchestrator(
             or "click"
             or "click_ref"
             or "type_ref"
-            or "open_browser";
+            or "open_browser"
+            or "create_goal"
+            or "update_goal_status"
+            or "mark_goal_pass"
+            or "mark_goal_fail";
 
     private static JsonObject? ParseMetadata(string? metadataJson)
     {
