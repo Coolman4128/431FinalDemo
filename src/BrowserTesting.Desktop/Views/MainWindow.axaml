@@ -8,104 +8,98 @@
         MinHeight="760"
         Title="LLM Browser Tester">
   <Window.DataTemplates>
-    <DataTemplate DataType="vm:UserTimelineItemViewModel">
-      <Grid Margin="0,0,0,14">
-        <Border Classes="card userCard"
-                HorizontalAlignment="Right"
-                MaxWidth="720">
-          <StackPanel Spacing="8">
-            <DockPanel LastChildFill="False">
-              <TextBlock Text="You" FontWeight="Bold" />
-              <TextBlock DockPanel.Dock="Right"
-                         Text="{Binding Timestamp}"
-                         Classes="caption" />
-            </DockPanel>
-            <SelectableTextBlock Text="{Binding Content}" TextWrapping="Wrap" />
-          </StackPanel>
-        </Border>
-      </Grid>
-    </DataTemplate>
-
-    <DataTemplate DataType="vm:AssistantTimelineItemViewModel">
-      <Grid Margin="0,0,0,14">
-        <Border Classes="card assistantCard"
-                HorizontalAlignment="Left"
-                MaxWidth="760">
-          <StackPanel Spacing="8">
-            <DockPanel LastChildFill="False">
-              <TextBlock Text="Assistant" FontWeight="Bold" />
-              <TextBlock DockPanel.Dock="Right"
-                         Text="{Binding Timestamp}"
-                         Classes="caption" />
-            </DockPanel>
-            <SelectableTextBlock Text="{Binding Content}" TextWrapping="Wrap" />
-          </StackPanel>
-        </Border>
-      </Grid>
-    </DataTemplate>
-
-    <DataTemplate DataType="vm:ToolTimelineItemViewModel">
-      <Grid Margin="0,0,0,14">
-        <Border Classes="card toolCard"
-                HorizontalAlignment="Left"
-                MaxWidth="680">
-          <StackPanel Spacing="10">
-            <DockPanel LastChildFill="False">
-              <TextBlock Text="{Binding DisplayTitle}" FontWeight="SemiBold" />
-              <TextBlock DockPanel.Dock="Right"
-                         Text="{Binding Timestamp}"
-                         Classes="caption" />
-            </DockPanel>
-
-            <StackPanel Spacing="6" IsVisible="{Binding IsRunning}">
-              <ProgressBar Classes="toolSpinner" IsIndeterminate="True" />
-              <TextBlock Text="Running"
-                         Foreground="{DynamicResource AppWarningBrush}"
-                         FontWeight="SemiBold" />
+    <DataTemplate DataType="vm:TimelineItemViewModel">
+      <Grid>
+        <Grid Margin="0,0,0,14" IsVisible="{Binding IsUserMessage}">
+          <Border Classes="card userCard"
+                  HorizontalAlignment="Right"
+                  MaxWidth="720">
+            <StackPanel Spacing="8">
+              <DockPanel LastChildFill="False">
+                <TextBlock Text="You" FontWeight="Bold" />
+                <TextBlock DockPanel.Dock="Right"
+                           Text="{Binding Timestamp}"
+                           Classes="caption" />
+              </DockPanel>
+              <SelectableTextBlock Text="{Binding Content}" TextWrapping="Wrap" />
             </StackPanel>
+          </Border>
+        </Grid>
 
-            <TextBlock Text="{Binding StatusText}"
-                       FontWeight="SemiBold"
-                       Foreground="{Binding StatusBrush}"
-                       IsVisible="{Binding IsCompleted}" />
+        <Grid Margin="0,0,0,14" IsVisible="{Binding IsAssistantMessage}">
+          <Border Classes="card assistantCard"
+                  HorizontalAlignment="Left"
+                  MaxWidth="760">
+            <StackPanel Spacing="8">
+              <DockPanel LastChildFill="False">
+                <TextBlock Text="Assistant" FontWeight="Bold" />
+                <TextBlock DockPanel.Dock="Right"
+                           Text="{Binding Timestamp}"
+                           Classes="caption" />
+              </DockPanel>
+              <SelectableTextBlock Text="{Binding Content}" TextWrapping="Wrap" />
+            </StackPanel>
+          </Border>
+        </Grid>
 
-            <StackPanel Spacing="10" IsVisible="{Binding HasFinalReport}">
-              <StackPanel Spacing="4" IsVisible="{Binding HasFinalSummary}">
-                <TextBlock Text="Summary" Classes="sectionLabel" />
-                <SelectableTextBlock Text="{Binding FinalSummary}" TextWrapping="Wrap" />
+        <Grid Margin="0,0,0,14" IsVisible="{Binding IsTool}">
+          <Border Classes="card toolCard"
+                  HorizontalAlignment="Left"
+                  MaxWidth="680">
+            <StackPanel Spacing="10">
+              <DockPanel LastChildFill="False">
+                <TextBlock Text="{Binding DisplayTitle}" FontWeight="SemiBold" />
+                <TextBlock DockPanel.Dock="Right"
+                           Text="{Binding Timestamp}"
+                           Classes="caption" />
+              </DockPanel>
+
+              <StackPanel Spacing="6" IsVisible="{Binding IsRunning}">
+                <ProgressBar Classes="toolSpinner" IsIndeterminate="True" />
+                <TextBlock Text="Running"
+                           Foreground="{DynamicResource AppWarningBrush}"
+                           FontWeight="SemiBold" />
               </StackPanel>
 
-              <StackPanel Spacing="4" IsVisible="{Binding HasFinalTestResults}">
-                <TextBlock Text="Test Results" Classes="sectionLabel" />
-                <SelectableTextBlock Text="{Binding FinalTestResults}" TextWrapping="Wrap" />
-              </StackPanel>
+              <TextBlock Text="{Binding StatusText}"
+                         FontWeight="SemiBold"
+                         Foreground="{Binding StatusBrush}"
+                         IsVisible="{Binding IsCompleted}" />
 
-              <StackPanel Spacing="4" IsVisible="{Binding HasFinalRemainingWork}">
-                <TextBlock Text="Remaining Work" Classes="sectionLabel" />
-                <SelectableTextBlock Text="{Binding FinalRemainingWork}" TextWrapping="Wrap" />
+              <StackPanel Spacing="10" IsVisible="{Binding HasFinalReport}">
+                <StackPanel Spacing="4" IsVisible="{Binding HasFinalSummary}">
+                  <TextBlock Text="Summary" Classes="sectionLabel" />
+                  <SelectableTextBlock Text="{Binding FinalSummary}" TextWrapping="Wrap" />
+                </StackPanel>
+
+                <StackPanel Spacing="4" IsVisible="{Binding HasFinalTestResults}">
+                  <TextBlock Text="Test Results" Classes="sectionLabel" />
+                  <SelectableTextBlock Text="{Binding FinalTestResults}" TextWrapping="Wrap" />
+                </StackPanel>
+
+                <StackPanel Spacing="4" IsVisible="{Binding HasFinalRemainingWork}">
+                  <TextBlock Text="Remaining Work" Classes="sectionLabel" />
+                  <SelectableTextBlock Text="{Binding FinalRemainingWork}" TextWrapping="Wrap" />
+                </StackPanel>
               </StackPanel>
             </StackPanel>
-          </StackPanel>
-        </Border>
-      </Grid>
-    </DataTemplate>
+          </Border>
+        </Grid>
 
-    <DataTemplate DataType="vm:GoalChangedTimelineItemViewModel">
-      <Grid Margin="0,0,0,14">
-        <Border Classes="card goalCard" MaxWidth="760">
-          <StackPanel Spacing="8">
-            <TextBlock Text="Goal Update" FontWeight="Bold" />
+        <Grid Margin="0,0,0,14" IsVisible="{Binding IsGoalChanged}">
+          <Border Classes="card goalCard" MaxWidth="760">
+            <StackPanel Spacing="8">
+              <TextBlock Text="Goal Update" FontWeight="Bold" />
+              <SelectableTextBlock Text="{Binding Content}" TextWrapping="Wrap" />
+            </StackPanel>
+          </Border>
+        </Grid>
+
+        <Grid Margin="0,0,0,14" IsVisible="{Binding IsSystem}">
+          <Border Classes="card systemCard" MaxWidth="760">
             <SelectableTextBlock Text="{Binding Content}" TextWrapping="Wrap" />
-          </StackPanel>
-        </Border>
-      </Grid>
-    </DataTemplate>
-
-    <DataTemplate DataType="vm:SystemTimelineItemViewModel">
-      <Grid Margin="0,0,0,14">
-        <Border Classes="card systemCard" MaxWidth="760">
-          <SelectableTextBlock Text="{Binding Content}" TextWrapping="Wrap" />
-        </Border>
+          </Border>
+        </Grid>
       </Grid>
     </DataTemplate>
   </Window.DataTemplates>

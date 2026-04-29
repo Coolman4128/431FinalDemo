@@ -21,13 +21,9 @@ public partial class App : Application
         if (ApplicationLifetime is IClassicDesktopStyleApplicationLifetime desktop)
         {
             var settings = AppSettings.CreateDefault(AppContext.BaseDirectory);
-            var settingsStore = new JsonAppSettingsStore();
-            settingsStore.LoadAsync(settings, CancellationToken.None).GetAwaiter().GetResult();
+            settings.LoadAsync(CancellationToken.None).GetAwaiter().GetResult();
             var repository = new SqliteChatRepository(settings);
             var browserSessionManager = new BrowserSessionManager(settings);
-            var secretStore = new DpapiSecretStore(repository);
-            var toolRegistry = new ToolRegistry();
-            var toolExecutor = new ToolExecutor(browserSessionManager, repository, secretStore, toolRegistry);
             var llmClient = new LmStudioLlmClient(new HttpClient
             {
                 Timeout = TimeSpan.FromMinutes(10),
@@ -35,15 +31,11 @@ public partial class App : Application
             var orchestrator = new ChatOrchestrator(
                 repository,
                 llmClient,
-                toolRegistry,
-                toolExecutor,
                 browserSessionManager,
-                secretStore,
                 settings);
-            var llmSettingsService = new LlmSettingsService(settings, settingsStore, llmClient);
 
             var mainWindow = new MainWindow();
-            mainWindow.DataContext = new MainWindowViewModel(orchestrator, new TextFileSaveService(mainWindow), llmSettingsService);
+            mainWindow.DataContext = new MainWindowViewModel(orchestrator, mainWindow.SaveTextAsync, settings, llmClient);
             desktop.MainWindow = mainWindow;
         }
 

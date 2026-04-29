@@ -1,5 +1,8 @@
+﻿#pragma warning disable CA1416
 using System.Data;
 using System.Globalization;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using BrowserTesting.Desktop.Models;
 using Microsoft.Data.Sqlite;
@@ -431,7 +434,7 @@ public sealed class SqliteChatRepository(AppSettings settings)
             await command.ExecuteNonQueryAsync(token);
         }, cancellationToken);
 
-    public Task SaveSecretAsync(Guid chatId, string name, string encryptedValue, CancellationToken cancellationToken) =>
+    public Task SaveSecretAsync(Guid chatId, string name, string value, CancellationToken cancellationToken) =>
         UseTransactionAsync(async (connection, transaction, token) =>
         {
             var command = CreateCommand(connection, transaction);
@@ -445,7 +448,7 @@ public sealed class SqliteChatRepository(AppSettings settings)
                 """;
             Add(command, "@chat_id", chatId);
             Add(command, "@name", name.Trim());
-            Add(command, "@encrypted_value", encryptedValue);
+            Add(command, "@encrypted_value", EncryptSecret(value));
             Add(command, "@updated_at_utc", DateTime.UtcNow);
             await command.ExecuteNonQueryAsync(token);
         }, cancellationToken);
@@ -458,7 +461,9 @@ public sealed class SqliteChatRepository(AppSettings settings)
             Add(command, "@chat_id", chatId);
             Add(command, "@name", name.Trim());
             var result = await command.ExecuteScalarAsync(token);
-            return result as string;
+            return result is string encryptedValue
+                ? DecryptSecret(encryptedValue)
+                : null;
         }, cancellationToken);
 
     public Task<IReadOnlyList<string>> ListSecretNamesAsync(Guid chatId, CancellationToken cancellationToken) =>
@@ -770,6 +775,20 @@ public sealed class SqliteChatRepository(AppSettings settings)
 
     private string Serialize<T>(T value) =>
         JsonSerializer.Serialize(value, jsonOptions);
+
+    private static string EncryptSecret(string value)
+    {
+        var clearBytes = Encoding.UTF8.GetBytes(value);
+        var encrypted = ProtectedData.Protect(clearBytes, null, DataProtectionScope.CurrentUser);
+        return Convert.ToBase64String(encrypted);
+    }
+
+    private static string DecryptSecret(string encryptedValue)
+    {
+        var encryptedBytes = Convert.FromBase64String(encryptedValue);
+        var clearBytes = ProtectedData.Unprotect(encryptedBytes, null, DataProtectionScope.CurrentUser);
+        return Encoding.UTF8.GetString(clearBytes);
+    }
 
     private BrowserSessionSnapshot DeserializeSnapshot(string? json, Guid runId)
     {

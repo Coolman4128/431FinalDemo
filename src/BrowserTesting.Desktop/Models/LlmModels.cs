@@ -2,6 +2,12 @@ using System.Text.Json.Nodes;
 
 namespace BrowserTesting.Desktop.Models;
 
+public enum LlmProvider
+{
+    Local = 0,
+    OpenAi = 1,
+}
+
 public sealed class LlmConnectionSettings
 {
     public required LlmProvider Provider { get; init; }
@@ -20,8 +26,6 @@ public sealed class LlmRequest
     public LlmToolChoiceMode ToolChoiceMode { get; init; } = LlmToolChoiceMode.Auto;
     public string? ForcedToolName { get; init; }
     public bool ParallelToolCalls { get; init; }
-    public string Model => Connection.Model;
-    public double Temperature => Connection.Temperature;
 }
 
 public enum LlmToolChoiceMode

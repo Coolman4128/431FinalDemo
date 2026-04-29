@@ -1,13 +1,14 @@
 using System.Collections.ObjectModel;
 using System.Linq;
+using BrowserTesting.Desktop.Classes;
 using BrowserTesting.Desktop.Models;
-using BrowserTesting.Desktop.Services;
 
 namespace BrowserTesting.Desktop.ViewModels;
 
 public sealed class LlmSettingsViewModel : ObservableObject
 {
-    private readonly LlmSettingsService settingsService;
+    private readonly AppSettings settings;
+    private readonly LmStudioLlmClient llmClient;
     private ProviderOptionViewModel? selectedProviderOption;
     private string? selectedModel;
     private string openAiApiKey = string.Empty;
@@ -19,9 +20,10 @@ public sealed class LlmSettingsViewModel : ObservableObject
     private string? draftLocalModelName;
     private string? draftOpenAiModelName;
 
-    public LlmSettingsViewModel(LlmSettingsService settingsService)
+    public LlmSettingsViewModel(AppSettings settings, LmStudioLlmClient llmClient)
     {
-        this.settingsService = settingsService;
+        this.settings = settings;
+        this.llmClient = llmClient;
         ProviderOptions =
         [
             new ProviderOptionViewModel(LlmProvider.Local, "Local server"),
@@ -160,7 +162,7 @@ public sealed class LlmSettingsViewModel : ObservableObject
 
     public bool HasValidationMessage => !string.IsNullOrWhiteSpace(ValidationMessage);
 
-    private LlmProvider SelectedProvider => SelectedProviderOption?.Value ?? settingsService.Settings.Provider;
+    private LlmProvider SelectedProvider => SelectedProviderOption?.Value ?? settings.Provider;
 
     private string? CurrentDraftModelName =>
         SelectedProvider == LlmProvider.OpenAi
@@ -172,10 +174,10 @@ public sealed class LlmSettingsViewModel : ObservableObject
         suppressProviderRefresh = true;
         try
         {
-            draftLocalModelName = settingsService.Settings.LocalModelName;
-            draftOpenAiModelName = settingsService.Settings.OpenAiModelName;
-            OpenAiApiKey = settingsService.Settings.OpenAiApiKey ?? string.Empty;
-            SelectedProviderOption = ProviderOptions.First(option => option.Value == settingsService.Settings.Provider);
+            draftLocalModelName = settings.LocalModelName;
+            draftOpenAiModelName = settings.OpenAiModelName;
+            OpenAiApiKey = settings.OpenAiApiKey ?? string.Empty;
+            SelectedProviderOption = ProviderOptions.First(option => option.Value == settings.Provider);
             SelectedModel = CurrentDraftModelName;
             ValidationMessage = string.Empty;
             ModelStatusText = "Loading models...";
@@ -204,12 +206,11 @@ public sealed class LlmSettingsViewModel : ObservableObject
             return;
         }
 
-        await settingsService.SaveAsync(
-            SelectedProvider,
-            draftLocalModelName,
-            draftOpenAiModelName,
-            OpenAiApiKey,
-            CancellationToken.None);
+        settings.Provider = SelectedProvider;
+        settings.LocalModelName = Normalize(draftLocalModelName) ?? settings.LocalModelName;
+        settings.OpenAiModelName = Normalize(draftOpenAiModelName) ?? settings.OpenAiModelName;
+        settings.OpenAiApiKey = Normalize(OpenAiApiKey);
+        await settings.SaveAsync(CancellationToken.None);
 
         IsOpen = false;
         ValidationMessage = string.Empty;
@@ -232,7 +233,10 @@ public sealed class LlmSettingsViewModel : ObservableObject
                 return;
             }
 
-            var models = await settingsService.ListModelsAsync(SelectedProvider, OpenAiApiKey, CancellationToken.None);
+            var apiKey = SelectedProvider == LlmProvider.OpenAi ? Normalize(OpenAiApiKey) : null;
+            var models = await llmClient.ListModelsAsync(
+                settings.CreateConnectionSettings(SelectedProvider, modelOverride: string.Empty, apiKeyOverride: apiKey),
+                CancellationToken.None);
             ReplaceModels(models);
 
             if (AvailableModels.Count == 0)
@@ -321,6 +325,9 @@ public sealed class LlmSettingsViewModel : ObservableObject
         SaveCommand.RaiseCanExecuteChanged();
         RefreshModelsCommand.RaiseCanExecuteChanged();
     }
+
+    private static string? Normalize(string? value) =>
+        string.IsNullOrWhiteSpace(value) ? null : value.Trim();
 }
 
 public sealed class ProviderOptionViewModel(LlmProvider value, string label)

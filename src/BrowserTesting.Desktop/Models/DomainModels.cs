@@ -1,6 +1,47 @@
+#pragma warning disable CA1416
+using System.Diagnostics;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
 using System.Text.Json.Nodes;
 
 namespace BrowserTesting.Desktop.Models;
+
+public enum GoalStatus
+{
+    Pending = 0,
+    Running = 1,
+    Passed = 2,
+    Failed = 3,
+}
+
+public enum TestRunStatus
+{
+    Pending = 0,
+    Running = 1,
+    WaitingForTool = 2,
+    Completed = 3,
+    Failed = 4,
+    Cancelled = 5,
+}
+
+public enum BrowserState
+{
+    NotStarted = 0,
+    Active = 1,
+    Closed = 2,
+    Failed = 3,
+}
+
+public enum TimelineItemKind
+{
+    UserMessage = 0,
+    AssistantMessage = 1,
+    ToolCallStarted = 2,
+    ToolCallFinished = 3,
+    GoalChanged = 4,
+    SystemNotice = 5,
+}
 
 public sealed class ChatSession
 {
@@ -137,6 +178,11 @@ public sealed class ToolInvocationContext
 
 public sealed class AppSettings
 {
+    private static readonly JsonSerializerOptions SerializerOptions = new(JsonSerializerDefaults.Web)
+    {
+        WriteIndented = true,
+    };
+
     public const string LocalServerBaseUrl = "http://localhost:1234/v1";
     public const string OpenAiBaseUrl = "https://api.openai.com/v1";
 
@@ -151,12 +197,6 @@ public sealed class AppSettings
     public string ScreenshotDirectory { get; set; } = string.Empty;
     public string ChromeProfileRoot { get; set; } = string.Empty;
     public string SettingsFilePath { get; set; } = string.Empty;
-
-    public string CurrentBaseUrl => Provider switch
-    {
-        LlmProvider.OpenAi => OpenAiBaseUrl,
-        _ => LocalServerBaseUrl,
-    };
 
     public string CurrentModelName
     {
@@ -179,8 +219,6 @@ public sealed class AppSettings
         }
     }
 
-    public string? CurrentApiKey => Provider == LlmProvider.OpenAi ? OpenAiApiKey : null;
-
     public LlmConnectionSettings CreateConnectionSettings(
         LlmProvider? providerOverride = null,
         string? modelOverride = null,
@@ -202,6 +240,64 @@ public sealed class AppSettings
         };
     }
 
+    public Task LoadAsync(CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(SettingsFilePath) || !File.Exists(SettingsFilePath))
+        {
+            return Task.CompletedTask;
+        }
+
+        try
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            using var stream = File.OpenRead(SettingsFilePath);
+            var persisted = JsonSerializer.Deserialize<PersistedAppSettings>(stream, SerializerOptions);
+            if (persisted is null)
+            {
+                return Task.CompletedTask;
+            }
+
+            Provider = Enum.IsDefined(typeof(LlmProvider), persisted.Provider)
+                ? persisted.Provider
+                : Provider;
+            LocalModelName = string.IsNullOrWhiteSpace(persisted.LocalModelName)
+                ? LocalModelName
+                : persisted.LocalModelName;
+            OpenAiModelName = string.IsNullOrWhiteSpace(persisted.OpenAiModelName)
+                ? OpenAiModelName
+                : persisted.OpenAiModelName;
+            OpenAiApiKey = DecryptOrUsePlaintext(
+                persisted.EncryptedOpenAiApiKey,
+                persisted.OpenAiApiKey);
+        }
+        catch (Exception ex)
+        {
+            Trace.WriteLine($"Failed to load app settings from '{SettingsFilePath}': {ex}");
+        }
+
+        return Task.CompletedTask;
+    }
+
+    public async Task SaveAsync(CancellationToken cancellationToken)
+    {
+        var directory = Path.GetDirectoryName(SettingsFilePath);
+        if (!string.IsNullOrWhiteSpace(directory))
+        {
+            Directory.CreateDirectory(directory);
+        }
+
+        var persisted = new PersistedAppSettings
+        {
+            Provider = Provider,
+            LocalModelName = LocalModelName,
+            OpenAiModelName = OpenAiModelName,
+            EncryptedOpenAiApiKey = Encrypt(OpenAiApiKey),
+        };
+
+        await using var stream = File.Create(SettingsFilePath);
+        await JsonSerializer.SerializeAsync(stream, persisted, SerializerOptions, cancellationToken);
+    }
+
     public static AppSettings CreateDefault(string rootDirectory)
     {
         var appDataRoot = Path.Combine(rootDirectory, "AppData");
@@ -214,5 +310,57 @@ public sealed class AppSettings
             ChromeProfileRoot = Path.Combine(appDataRoot, "ChromeProfiles"),
             SettingsFilePath = Path.Combine(appDataRoot, "settings.json"),
         };
+    }
+
+    private static string? Encrypt(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return null;
+        }
+
+        var clearBytes = Encoding.UTF8.GetBytes(value);
+        var encryptedBytes = ProtectedData.Protect(clearBytes, null, DataProtectionScope.CurrentUser);
+        return Convert.ToBase64String(encryptedBytes);
+    }
+
+    private static string? DecryptOrUsePlaintext(string? encryptedValue, string? plaintextValue)
+    {
+        if (!string.IsNullOrWhiteSpace(encryptedValue))
+        {
+            try
+            {
+                var encryptedBytes = Convert.FromBase64String(encryptedValue);
+                var clearBytes = ProtectedData.Unprotect(encryptedBytes, null, DataProtectionScope.CurrentUser);
+                return Encoding.UTF8.GetString(clearBytes);
+            }
+            catch (Exception ex)
+            {
+                Trace.WriteLine($"Failed to decrypt saved OpenAI API key: {ex}");
+
+                if (LooksLikePlaintextApiKey(encryptedValue))
+                {
+                    return encryptedValue;
+                }
+            }
+        }
+
+        return LooksLikePlaintextApiKey(plaintextValue)
+            ? plaintextValue
+            : null;
+    }
+
+    private static bool LooksLikePlaintextApiKey(string? value) =>
+        !string.IsNullOrWhiteSpace(value) &&
+        (value.StartsWith("sk-", StringComparison.OrdinalIgnoreCase) ||
+         value.StartsWith("sess-", StringComparison.OrdinalIgnoreCase));
+
+    private sealed class PersistedAppSettings
+    {
+        public LlmProvider Provider { get; set; } = LlmProvider.Local;
+        public string? LocalModelName { get; set; }
+        public string? OpenAiModelName { get; set; }
+        public string? EncryptedOpenAiApiKey { get; set; }
+        public string? OpenAiApiKey { get; set; }
     }
 }
