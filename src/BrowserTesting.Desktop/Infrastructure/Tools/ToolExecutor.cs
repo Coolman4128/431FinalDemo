@@ -1,16 +1,18 @@
+using System.Text.Json;
 using System.Text.Json.Nodes;
-using BrowserTesting.Core.Abstractions;
 using BrowserTesting.Core.Llm;
 using BrowserTesting.Core.Models;
+using BrowserTesting.Infrastructure.Browser;
+using BrowserTesting.Infrastructure.Persistence;
+using BrowserTesting.Infrastructure.Secrets;
 
 namespace BrowserTesting.Infrastructure.Tools;
 
 public sealed class ToolExecutor(
-    IBrowserSessionManager browserSessionManager,
-    IGoalService goalService,
-    IChatRepository repository,
-    ISecretStore secretStore,
-    IToolRegistry toolRegistry) : IToolExecutor
+    BrowserSessionManager browserSessionManager,
+    SqliteChatRepository repository,
+    DpapiSecretStore secretStore,
+    ToolRegistry toolRegistry)
 {
     private const int MinimumEndTaskNarrativeLength = 120;
 
@@ -114,7 +116,7 @@ public sealed class ToolExecutor(
             return ToolExecutionResult.Failed("Goal title and success criteria are required.");
         }
 
-        var existingGoals = await goalService.ListGoalsAsync(context.TestRunId, cancellationToken);
+        var existingGoals = await repository.ListGoalsAsync(context.TestRunId, cancellationToken);
         var existingGoal = existingGoals.FirstOrDefault(goal => IsDuplicateGoal(goal, title, successCriteria));
         if (existingGoal is not null)
         {
@@ -124,7 +126,7 @@ public sealed class ToolExecutor(
                 "Use the existing active-run goal ID. Do not create a duplicate goal.");
         }
 
-        var goal = await goalService.CreateGoalAsync(context.ChatSessionId, context.TestRunId, title, successCriteria, cancellationToken);
+        var goal = await CreateGoalAsync(context.ChatSessionId, context.TestRunId, title, successCriteria, cancellationToken);
         return ToolExecutionResult.Successful("Goal created.", GoalNode(goal));
     }
 
@@ -140,7 +142,7 @@ public sealed class ToolExecutor(
             return ToolExecutionResult.Failed("Status must be pending, running, passed, or failed.");
         }
 
-        var goals = await goalService.ListGoalsAsync(context.TestRunId, cancellationToken);
+        var goals = await repository.ListGoalsAsync(context.TestRunId, cancellationToken);
         var existingGoal = goals.SingleOrDefault(candidate => candidate.Id == goalId);
         if (existingGoal is null)
         {
@@ -165,7 +167,7 @@ public sealed class ToolExecutor(
                     : "Use a Pending or Running goal_id from active_run.goals. Do not mark an already terminal goal again.");
         }
 
-        var goal = await goalService.UpdateGoalStatusAsync(
+        var goal = await UpdateGoalStatusAsync(
             context.ChatSessionId,
             context.TestRunId,
             goalId,
@@ -181,7 +183,7 @@ public sealed class ToolExecutor(
 
     private async Task<ToolExecutionResult> ListGoalsAsync(ToolInvocationContext context, CancellationToken cancellationToken)
     {
-        var goals = await goalService.ListGoalsAsync(context.TestRunId, cancellationToken);
+        var goals = await repository.ListGoalsAsync(context.TestRunId, cancellationToken);
         return ToolExecutionResult.Successful("Goals listed.", new JsonArray(goals.Select(GoalNode).ToArray()));
     }
 
@@ -213,7 +215,7 @@ public sealed class ToolExecutor(
                 $"End task summary and test_results must each be paragraph-length text of at least {MinimumEndTaskNarrativeLength} characters.");
         }
 
-        var goals = await goalService.ListGoalsAsync(context.TestRunId, cancellationToken);
+        var goals = await repository.ListGoalsAsync(context.TestRunId, cancellationToken);
         var unresolved = goals
             .Where(goal => goal.Status is GoalStatus.Pending or GoalStatus.Running)
             .ToArray();
@@ -281,6 +283,71 @@ public sealed class ToolExecutor(
     {
         var names = await secretStore.ListSecretNamesAsync(context.ChatSessionId, cancellationToken);
         return ToolExecutionResult.Successful("Secrets listed.", new JsonArray(names.Select(name => JsonValue.Create(name)).ToArray()));
+    }
+
+    private async Task<GoalItem> CreateGoalAsync(Guid chatId, Guid runId, string title, string successCriteria, CancellationToken cancellationToken)
+    {
+        var now = DateTime.UtcNow;
+        var goal = new GoalItem
+        {
+            Id = Guid.NewGuid(),
+            TestRunId = runId,
+            Title = title.Trim(),
+            SuccessCriteria = successCriteria.Trim(),
+            Status = GoalStatus.Pending,
+            CreatedAtUtc = now,
+            UpdatedAtUtc = now,
+        };
+
+        await repository.AddGoalAsync(goal, cancellationToken);
+        await AddGoalTimelineEntryAsync(chatId, runId, goal, "Goal created.", cancellationToken);
+        return goal;
+    }
+
+    private async Task<GoalItem?> UpdateGoalStatusAsync(
+        Guid chatId,
+        Guid runId,
+        Guid goalId,
+        GoalStatus status,
+        string? note,
+        string? evidence,
+        CancellationToken cancellationToken)
+    {
+        var goals = await repository.ListGoalsAsync(runId, cancellationToken);
+        var goal = goals.SingleOrDefault(candidate => candidate.Id == goalId);
+        if (goal is null)
+        {
+            return null;
+        }
+
+        goal.Status = status;
+        goal.Note = string.IsNullOrWhiteSpace(note) ? goal.Note : note.Trim();
+        goal.Evidence = string.IsNullOrWhiteSpace(evidence) ? goal.Evidence : evidence.Trim();
+        goal.UpdatedAtUtc = DateTime.UtcNow;
+        goal.CompletedAtUtc = status is GoalStatus.Passed or GoalStatus.Failed
+            ? DateTime.UtcNow
+            : null;
+
+        await repository.UpdateGoalAsync(goal, cancellationToken);
+        await AddGoalTimelineEntryAsync(chatId, runId, goal, $"Goal marked as {status}.", cancellationToken);
+        return goal;
+    }
+
+    private async Task AddGoalTimelineEntryAsync(Guid chatId, Guid runId, GoalItem goal, string summary, CancellationToken cancellationToken)
+    {
+        await repository.AddTimelineEntryAsync(
+            new TimelineEntry
+            {
+                Id = Guid.NewGuid(),
+                ChatSessionId = chatId,
+                TestRunId = runId,
+                Kind = TimelineItemKind.GoalChanged,
+                Role = "system",
+                Content = $"{summary} {goal.Title}",
+                MetadataJson = JsonSerializer.Serialize(goal),
+                CreatedAtUtc = DateTime.UtcNow,
+            },
+            cancellationToken);
     }
 
     private static JsonObject GoalNode(GoalItem goal) =>

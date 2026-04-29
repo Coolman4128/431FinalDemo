@@ -1,5 +1,4 @@
 using System.Collections.ObjectModel;
-using BrowserTesting.Core.Abstractions;
 using BrowserTesting.Core.Models;
 using BrowserTesting.Core.Orchestration;
 using BrowserTesting.Core.Services;
@@ -10,9 +9,9 @@ namespace BrowserTesting.Desktop.ViewModels;
 
 public sealed class MainWindowViewModel : ObservableObject
 {
-    private readonly IChatOrchestrator orchestrator;
-    private readonly ITextFileSaveService textFileSaveService;
-    private readonly ILlmSettingsService llmSettingsService;
+    private readonly ChatOrchestrator orchestrator;
+    private readonly TextFileSaveService textFileSaveService;
+    private readonly LlmSettingsService llmSettingsService;
     private readonly Action<Action> uiDispatcher;
     private readonly ChatListItemViewModel draftChatItem = ChatListItemViewModel.CreateDraft();
     private ChatListItemViewModel? selectedChat;
@@ -33,9 +32,9 @@ public sealed class MainWindowViewModel : ObservableObject
     private string selectionTranscriptText = string.Empty;
 
     public MainWindowViewModel(
-        IChatOrchestrator orchestrator,
-        ITextFileSaveService textFileSaveService,
-        ILlmSettingsService llmSettingsService,
+        ChatOrchestrator orchestrator,
+        TextFileSaveService textFileSaveService,
+        LlmSettingsService llmSettingsService,
         Action<Action>? uiDispatcher = null)
     {
         this.orchestrator = orchestrator;
@@ -372,17 +371,17 @@ public sealed class MainWindowViewModel : ObservableObject
 
     private void ApplyBrowserSnapshot(BrowserSessionSnapshot snapshot)
     {
-        BrowserStatus = snapshot.RestoreStatus switch
+        BrowserStatus = snapshot.State switch
         {
-            BrowserTesting.Core.Models.RestoreStatus.Closed => "Browser closed",
-            BrowserTesting.Core.Models.RestoreStatus.Failed => "Browser unavailable",
-            BrowserTesting.Core.Models.RestoreStatus.NotStarted when snapshot.CurrentUrl is null => "No browser",
+            BrowserState.Closed => "Browser closed",
+            BrowserState.Failed => "Browser unavailable",
+            BrowserState.NotStarted when snapshot.CurrentUrl is null => "No browser",
             _ when snapshot.CurrentUrl is null => "Browser idle",
             _ => "Browser active",
         };
         BrowserUrl = snapshot.CurrentUrl ?? "n/a";
         BrowserTitle = snapshot.PageTitle ?? "n/a";
-        RestoreStatus = snapshot.RestoreStatus.ToString();
+        RestoreStatus = snapshot.State.ToString();
     }
 
     private void ReplaceChats(IReadOnlyList<ChatSessionSummary> chats)

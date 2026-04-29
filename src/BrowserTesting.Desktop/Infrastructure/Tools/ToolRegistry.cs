@@ -1,10 +1,9 @@
 using System.Text.Json.Nodes;
-using BrowserTesting.Core.Abstractions;
 using BrowserTesting.Core.Llm;
 
 namespace BrowserTesting.Infrastructure.Tools;
 
-public sealed class ToolRegistry : IToolRegistry
+public sealed class ToolRegistry
 {
     private readonly IReadOnlyList<LlmToolDefinition> definitions =
     [

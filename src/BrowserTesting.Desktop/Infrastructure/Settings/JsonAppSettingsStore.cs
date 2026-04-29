@@ -1,15 +1,13 @@
+#pragma warning disable CA1416
 using System.Diagnostics;
-using System.Runtime.Versioning;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
-using BrowserTesting.Core.Abstractions;
 using BrowserTesting.Core.Models;
 
 namespace BrowserTesting.Infrastructure.Settings;
 
-[SupportedOSPlatform("windows")]
-public sealed class JsonAppSettingsStore : IAppSettingsStore
+public sealed class JsonAppSettingsStore
 {
     private static readonly JsonSerializerOptions SerializerOptions = new(JsonSerializerDefaults.Web)
     {

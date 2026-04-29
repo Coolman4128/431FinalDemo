@@ -7,7 +7,7 @@ namespace BrowserTesting.Desktop.ViewModels;
 
 public sealed class LlmSettingsViewModel : ObservableObject
 {
-    private readonly ILlmSettingsService settingsService;
+    private readonly LlmSettingsService settingsService;
     private ProviderOptionViewModel? selectedProviderOption;
     private string? selectedModel;
     private string openAiApiKey = string.Empty;
@@ -19,7 +19,7 @@ public sealed class LlmSettingsViewModel : ObservableObject
     private string? draftLocalModelName;
     private string? draftOpenAiModelName;
 
-    public LlmSettingsViewModel(ILlmSettingsService settingsService)
+    public LlmSettingsViewModel(LlmSettingsService settingsService)
     {
         this.settingsService = settingsService;
         ProviderOptions =

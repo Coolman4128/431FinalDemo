@@ -3,13 +3,12 @@ using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
-using BrowserTesting.Core.Abstractions;
 using BrowserTesting.Core.Llm;
 using BrowserTesting.Core.Models;
 
 namespace BrowserTesting.Infrastructure.Llm;
 
-public sealed class LmStudioLlmClient(HttpClient httpClient) : ILlmClient
+public sealed class LmStudioLlmClient(HttpClient httpClient)
 {
     public async IAsyncEnumerable<LlmStreamEvent> StreamCompletionAsync(LlmRequest request, [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
     {

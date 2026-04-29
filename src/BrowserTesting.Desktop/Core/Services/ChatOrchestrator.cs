@@ -1,21 +1,25 @@
 using System.Text;
 using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
-using BrowserTesting.Core.Abstractions;
 using BrowserTesting.Core.Llm;
 using BrowserTesting.Core.Models;
 using BrowserTesting.Core.Orchestration;
+using BrowserTesting.Infrastructure.Browser;
+using BrowserTesting.Infrastructure.Llm;
+using BrowserTesting.Infrastructure.Persistence;
+using BrowserTesting.Infrastructure.Secrets;
+using BrowserTesting.Infrastructure.Tools;
 
 namespace BrowserTesting.Core.Services;
 
 public sealed class ChatOrchestrator(
-    IChatRepository repository,
-    ILlmClient llmClient,
-    IToolRegistry toolRegistry,
-    IToolExecutor toolExecutor,
-    IBrowserSessionManager browserSessionManager,
-    ISecretStore secretStore,
-    AppSettings settings) : IChatOrchestrator
+    SqliteChatRepository repository,
+    LmStudioLlmClient llmClient,
+    ToolRegistry toolRegistry,
+    ToolExecutor toolExecutor,
+    BrowserSessionManager browserSessionManager,
+    DpapiSecretStore secretStore,
+    AppSettings settings)
 {
     public Task InitializeAsync(CancellationToken cancellationToken) =>
         repository.InitializeAsync(cancellationToken);
@@ -26,21 +30,6 @@ public sealed class ChatOrchestrator(
     public Task<ChatSession> CreateChatAsync(string? title, CancellationToken cancellationToken) =>
         repository.CreateChatAsync(title, cancellationToken);
 
-    public async Task<BrowserSessionSnapshot?> RefreshBrowserSnapshotAsync(
-        Guid runId,
-        Action<OrchestratorUpdate>? onUpdate,
-        CancellationToken cancellationToken)
-    {
-        var snapshot = await browserSessionManager.GetSnapshotAsync(runId, cancellationToken);
-        if (snapshot is null)
-        {
-            return null;
-        }
-
-        onUpdate?.Invoke(new BrowserSnapshotUpdated(runId, snapshot));
-        return snapshot;
-    }
-
     public async Task<ChatSession?> LoadChatAsync(
         Guid chatId,
         Action<OrchestratorUpdate>? onUpdate,
@@ -50,19 +39,6 @@ public sealed class ChatOrchestrator(
         if (chat is null)
         {
             return null;
-        }
-
-        if (onUpdate is not null)
-        {
-            var run = chat.Runs
-                .OrderByDescending(candidate => candidate.UpdatedAtUtc)
-                .FirstOrDefault();
-
-            if (run is not null && RequiresResumeNormalization(run.BrowserSnapshot))
-            {
-                run.BrowserSnapshot = CloseSnapshot(run.BrowserSnapshot);
-                await repository.SaveBrowserSnapshotAsync(run.Id, run.BrowserSnapshot, cancellationToken);
-            }
         }
 
         onUpdate?.Invoke(new ChatLoaded(chat));
@@ -143,8 +119,6 @@ public sealed class ChatOrchestrator(
 
                 onUpdate(new TimelineEntryUpserted(assistantEntry));
 
-                var toolDefinitions = toolRegistry.GetToolDefinitions();
-                var toolNames = toolDefinitions.Select(definition => definition.Name).ToArray();
                 var toolBuilders = new Dictionary<int, ToolCallAccumulator>();
                 await foreach (var streamEvent in llmClient.StreamCompletionAsync(BuildRequest(chat, run, Math.Max(settings.MaxToolIterations - iteration, 0), connection), cancellationToken))
                 {
@@ -174,63 +148,8 @@ public sealed class ChatOrchestrator(
                     }
                 }
 
-                if (toolBuilders.Count == 0 &&
-                    TryRecoverToolCalls(
-                        assistantEntry.Content,
-                        toolNames,
-                        out var recoveredContent,
-                        out var recoveredToolCalls))
-                {
-                    assistantEntry.Content = recoveredContent;
-                    await repository.UpdateTimelineEntryAsync(assistantEntry, cancellationToken);
-                    onUpdate(new TimelineEntryUpserted(assistantEntry));
-
-                    foreach (var recoveredToolCall in recoveredToolCalls)
-                    {
-                        toolBuilders[recoveredToolCall.Index] = ToolCallAccumulator.FromToolCall(recoveredToolCall);
-                    }
-                }
-
-                if (toolBuilders.Count == 0 &&
-                    TryInferToolCallsFromIntent(
-                        assistantEntry.Content,
-                        run,
-                        toolNames,
-                        out var inferredContent,
-                        out var inferredToolCalls))
-                {
-                    assistantEntry.Content = inferredContent;
-                    await repository.UpdateTimelineEntryAsync(assistantEntry, cancellationToken);
-                    onUpdate(new TimelineEntryUpserted(assistantEntry));
-
-                    foreach (var inferredToolCall in inferredToolCalls)
-                    {
-                        toolBuilders[inferredToolCall.Index] = ToolCallAccumulator.FromToolCall(inferredToolCall);
-                    }
-
-                    await AddSystemNoticeAsync(
-                        chatId,
-                        run.Id,
-                        "Recovered an implied tool action from the assistant text. Emit the tool call directly next time instead of only describing the next step.",
-                        onUpdate,
-                        cancellationToken);
-                }
-
                 if (toolBuilders.Count == 0)
                 {
-                    if (TryDetectNarratedToolIntent(
-                            assistantEntry.Content,
-                            toolNames,
-                            out var mentionedToolName))
-                    {
-                        await AddSystemNoticeAsync(
-                            chatId,
-                            run.Id,
-                            $"Your last reply mentioned the tool `{mentionedToolName}` but did not emit a structured tool call. On the next turn, call the tool directly instead of narrating it in plain text.",
-                            onUpdate,
-                            cancellationToken);
-                    }
-
                     stalledTurns++;
                     if (string.IsNullOrWhiteSpace(assistantEntry.Content))
                     {
@@ -505,7 +424,7 @@ public sealed class ChatOrchestrator(
         builder.AppendLine("- If the user listed goals, create each distinct requested goal once. Do not recreate semantically equivalent goals.");
         builder.AppendLine("- active_run.goals is already current. Do not call list_goals just to rediscover the same IDs.");
         builder.AppendLine("- Only use goal IDs from active_run.goals. Previous-run summaries are not actionable.");
-        builder.AppendLine("- Do not call open_browser when active_run.browser.restore_status is Active; continue from the current page.");
+        builder.AppendLine("- Do not call open_browser when active_run.browser.state is Active; continue from the current page.");
         builder.AppendLine("- After inspect_page returns usable refs, act on those refs. Do not inspect the same unchanged page repeatedly.");
         builder.AppendLine("- Refs are page-local. If the current URL differs from the inspection URL, inspect the current page before click_ref/type_ref.");
         builder.AppendLine("- When observed evidence satisfies a pending goal, mark that goal passed immediately before moving to later dependent work.");
@@ -556,7 +475,6 @@ public sealed class ChatOrchestrator(
             ["recent_tool_outcomes"] = GetRecentToolOutcomes(chat, activeRun.Id),
             ["last_page_inspection"] = GetLastPageInspection(chat, activeRun.Id),
             ["recent_page_inspections"] = GetRecentPageInspections(chat, activeRun.Id),
-            ["previous_runs_summary"] = BuildPreviousRunSummary(chat, activeRun.Id),
         };
     }
 
@@ -674,31 +592,10 @@ public sealed class ChatOrchestrator(
         {
             ["current_url"] = Truncate(snapshot.CurrentUrl, 500),
             ["page_title"] = Truncate(snapshot.PageTitle, 300),
-            ["restore_status"] = snapshot.RestoreStatus.ToString(),
+            ["state"] = snapshot.State.ToString(),
             ["tab_count"] = snapshot.Tabs.Count,
             ["tabs"] = tabs,
         };
-    }
-
-    private static JsonArray BuildPreviousRunSummary(ChatSession chat, Guid activeRunId)
-    {
-        var summaries = new JsonArray();
-        foreach (var run in chat.Runs
-                     .Where(candidate => candidate.Id != activeRunId)
-                     .OrderByDescending(candidate => candidate.UpdatedAtUtc)
-                     .Take(2))
-        {
-            summaries.Add(new JsonObject
-            {
-                ["status"] = run.Status.ToString(),
-                ["user_prompt"] = Truncate(run.UserPrompt, 500),
-                ["failure_reason"] = Truncate(run.FailureReason, 300),
-                ["browser"] = BuildBrowserSnapshotNode(run.BrowserSnapshot),
-                ["goals_without_ids"] = BuildGoalLedger(run.Goals, includeIds: false),
-            });
-        }
-
-        return summaries;
     }
 
     private static string? ExtractEndTaskSummary(ToolExecutionResult result)
@@ -734,484 +631,6 @@ public sealed class ChatOrchestrator(
         }
     }
 
-    private static bool TryRecoverToolCalls(
-        string content,
-        IReadOnlyCollection<string> toolNames,
-        out string cleanedContent,
-        out IReadOnlyList<LlmToolCall> toolCalls)
-    {
-        if (TryExtractTaggedToolCalls(content, out cleanedContent, out toolCalls))
-        {
-            return true;
-        }
-
-        if (TryExtractJsonEnvelopeToolCalls(content, toolNames, out cleanedContent, out toolCalls))
-        {
-            return true;
-        }
-
-        if (TryExtractNarratedToolCalls(content, toolNames, out cleanedContent, out toolCalls))
-        {
-            return true;
-        }
-
-        cleanedContent = content;
-        toolCalls = [];
-        return false;
-    }
-
-    private static bool TryExtractTaggedToolCalls(
-        string content,
-        out string cleanedContent,
-        out IReadOnlyList<LlmToolCall> toolCalls)
-    {
-        const RegexOptions options = RegexOptions.IgnoreCase | RegexOptions.Singleline;
-        var toolCallMatches = Regex.Matches(
-            content,
-            @"<tool_call>\s*<function=(?<name>[^>\s]+)>\s*(?<body>.*?)\s*</function>\s*</tool_call>",
-            options);
-
-        if (toolCallMatches.Count == 0)
-        {
-            cleanedContent = content;
-            toolCalls = [];
-            return false;
-        }
-
-        var extracted = new List<LlmToolCall>();
-        var index = 0;
-        foreach (Match match in toolCallMatches)
-        {
-            var functionName = match.Groups["name"].Value.Trim();
-            var body = match.Groups["body"].Value;
-            var arguments = new JsonObject();
-
-            var parameterMatches = Regex.Matches(
-                body,
-                @"<parameter=(?<name>[^>\s]+)>\s*(?<value>.*?)\s*</parameter>",
-                options);
-
-            foreach (Match parameterMatch in parameterMatches)
-            {
-                var parameterName = parameterMatch.Groups["name"].Value.Trim();
-                var rawValue = parameterMatch.Groups["value"].Value.Trim();
-                arguments[parameterName] = CoerceTaggedValue(rawValue);
-            }
-
-            extracted.Add(new LlmToolCall
-            {
-                Index = index++,
-                Id = Guid.NewGuid().ToString("N"),
-                Name = functionName,
-                ArgumentsJson = arguments.ToJsonString(),
-            });
-        }
-
-        cleanedContent = Regex.Replace(
-            content,
-            @"<tool_call>\s*<function=[^>\s]+>\s*.*?\s*</function>\s*</tool_call>",
-            string.Empty,
-            options).Trim();
-
-        toolCalls = extracted;
-        return true;
-    }
-
-    private static bool TryExtractJsonEnvelopeToolCalls(
-        string content,
-        IReadOnlyCollection<string> toolNames,
-        out string cleanedContent,
-        out IReadOnlyList<LlmToolCall> toolCalls)
-    {
-        var extracted = new List<LlmToolCall>();
-        var rewritten = content;
-
-        var codeBlockMatches = Regex.Matches(
-            content,
-            @"```(?:json)?\s*(?<body>\{.*?\})\s*```",
-            RegexOptions.IgnoreCase | RegexOptions.Singleline);
-
-        foreach (Match match in codeBlockMatches)
-        {
-            if (!TryParseJsonEnvelopeToolCall(match.Groups["body"].Value, toolNames, extracted.Count, out var toolCall))
-            {
-                continue;
-            }
-
-            extracted.Add(toolCall);
-            rewritten = rewritten.Replace(match.Value, string.Empty, StringComparison.Ordinal);
-        }
-
-        if (extracted.Count == 0)
-        {
-            cleanedContent = content;
-            toolCalls = [];
-            return false;
-        }
-
-        cleanedContent = rewritten.Trim();
-        toolCalls = extracted;
-        return true;
-    }
-
-    private static bool TryParseJsonEnvelopeToolCall(
-        string rawJson,
-        IReadOnlyCollection<string> toolNames,
-        int index,
-        out LlmToolCall toolCall)
-    {
-        toolCall = default!;
-
-        try
-        {
-            var envelope = JsonNode.Parse(rawJson)?.AsObject();
-            if (envelope is null)
-            {
-                return false;
-            }
-
-            var candidateName = envelope["tool"]?.GetValue<string>()
-                ?? envelope["name"]?.GetValue<string>()
-                ?? envelope["function"]?.GetValue<string>();
-            if (string.IsNullOrWhiteSpace(candidateName) || !toolNames.Contains(candidateName))
-            {
-                return false;
-            }
-
-            var arguments = envelope["arguments"]?.AsObject()
-                ?? envelope["params"]?.AsObject()
-                ?? envelope["parameters"]?.AsObject();
-            if (arguments is null)
-            {
-                return false;
-            }
-
-            toolCall = new LlmToolCall
-            {
-                Index = index,
-                Id = Guid.NewGuid().ToString("N"),
-                Name = candidateName,
-                ArgumentsJson = arguments.ToJsonString(),
-            };
-            return true;
-        }
-        catch
-        {
-            return false;
-        }
-    }
-
-    private static bool TryExtractNarratedToolCalls(
-        string content,
-        IReadOnlyCollection<string> toolNames,
-        out string cleanedContent,
-        out IReadOnlyList<LlmToolCall> toolCalls)
-    {
-        var extracted = new List<LlmToolCall>();
-        var remaining = content;
-
-        foreach (var toolName in toolNames)
-        {
-            while (TryExtractNarratedToolCall(remaining, toolName, extracted.Count, out var toolCall, out remaining))
-            {
-                extracted.Add(toolCall);
-            }
-        }
-
-        if (extracted.Count == 0)
-        {
-            cleanedContent = content;
-            toolCalls = [];
-            return false;
-        }
-
-        cleanedContent = remaining.Trim();
-        toolCalls = extracted;
-        return true;
-    }
-
-    private static bool TryExtractNarratedToolCall(
-        string content,
-        string toolName,
-        int index,
-        out LlmToolCall toolCall,
-        out string updatedContent)
-    {
-        toolCall = default!;
-        updatedContent = content;
-
-        var toolMatch = Regex.Match(
-            content,
-            $@"(?<prefix>(?:calling|call|use|using|invoke|invoking)\s+)?`?{Regex.Escape(toolName)}`?",
-            RegexOptions.IgnoreCase);
-        if (!toolMatch.Success)
-        {
-            return false;
-        }
-
-        var searchStart = toolMatch.Index + toolMatch.Length;
-        var jsonStart = content.IndexOf('{', searchStart);
-        if (jsonStart < 0)
-        {
-            return false;
-        }
-
-        if (!TryExtractBalancedJsonObject(content, jsonStart, out var rawArguments, out var jsonEndExclusive))
-        {
-            return false;
-        }
-
-        try
-        {
-            var arguments = JsonNode.Parse(rawArguments)?.AsObject();
-            if (arguments is null)
-            {
-                return false;
-            }
-
-            toolCall = new LlmToolCall
-            {
-                Index = index,
-                Id = Guid.NewGuid().ToString("N"),
-                Name = toolName,
-                ArgumentsJson = arguments.ToJsonString(),
-            };
-
-            updatedContent = (content[..toolMatch.Index] + content[jsonEndExclusive..]).Trim();
-            return true;
-        }
-        catch
-        {
-            return false;
-        }
-    }
-
-    private static bool TryExtractBalancedJsonObject(
-        string content,
-        int startIndex,
-        out string rawJson,
-        out int endExclusive)
-    {
-        rawJson = string.Empty;
-        endExclusive = startIndex;
-
-        var depth = 0;
-        var inString = false;
-        var escaping = false;
-
-        for (var index = startIndex; index < content.Length; index++)
-        {
-            var current = content[index];
-            if (escaping)
-            {
-                escaping = false;
-                continue;
-            }
-
-            if (current == '\\' && inString)
-            {
-                escaping = true;
-                continue;
-            }
-
-            if (current == '"')
-            {
-                inString = !inString;
-                continue;
-            }
-
-            if (inString)
-            {
-                continue;
-            }
-
-            if (current == '{')
-            {
-                depth++;
-            }
-            else if (current == '}')
-            {
-                depth--;
-                if (depth == 0)
-                {
-                    endExclusive = index + 1;
-                    rawJson = content[startIndex..endExclusive];
-                    return true;
-                }
-            }
-        }
-
-        return false;
-    }
-
-    private static bool TryDetectNarratedToolIntent(
-        string content,
-        IEnumerable<string> toolNames,
-        out string? toolName)
-    {
-        foreach (var candidate in toolNames)
-        {
-            if (Regex.IsMatch(
-                    content,
-                    $@"(?:call|calling|use|using|invoke|invoking).{{0,40}}`?{Regex.Escape(candidate)}`?",
-                    RegexOptions.IgnoreCase | RegexOptions.Singleline))
-            {
-                toolName = candidate;
-                return true;
-            }
-        }
-
-        toolName = null;
-        return false;
-    }
-
-    private static bool TryInferToolCallsFromIntent(
-        string content,
-        TestRun run,
-        IReadOnlyCollection<string> toolNames,
-        out string cleanedContent,
-        out IReadOnlyList<LlmToolCall> toolCalls)
-    {
-        var extracted = new List<LlmToolCall>();
-        cleanedContent = content;
-
-        if (TryInferOpenBrowserToolCall(content, run, toolNames, out var openBrowserCall))
-        {
-            extracted.Add(openBrowserCall);
-            cleanedContent = RemoveSentenceContaining(content, "open");
-        }
-        else if (TryInferNoArgumentToolCall(content, toolNames, "list_goals", "list goals", out var listGoalsCall))
-        {
-            extracted.Add(listGoalsCall);
-            cleanedContent = RemoveSentenceContaining(content, "list goals");
-        }
-        else if (TryInferNoArgumentToolCall(content, toolNames, "get_page_state", "page state", out var pageStateCall))
-        {
-            extracted.Add(pageStateCall);
-            cleanedContent = RemoveSentenceContaining(content, "page state");
-        }
-
-        toolCalls = extracted;
-        return extracted.Count > 0;
-    }
-
-    private static bool TryInferOpenBrowserToolCall(
-        string content,
-        TestRun run,
-        IReadOnlyCollection<string> toolNames,
-        out LlmToolCall toolCall)
-    {
-        toolCall = default!;
-
-        if (!toolNames.Contains("open_browser"))
-        {
-            return false;
-        }
-
-        if (!Regex.IsMatch(content, @"\b(open|opening|launch|launching)\b.*\b(browser|chrome)\b", RegexOptions.IgnoreCase | RegexOptions.Singleline) &&
-            !Regex.IsMatch(content, @"\bnavigat(e|ing)\b.*\bgoogle\b", RegexOptions.IgnoreCase | RegexOptions.Singleline))
-        {
-            return false;
-        }
-
-        if (!string.IsNullOrWhiteSpace(run.BrowserSnapshot.CurrentUrl) ||
-            !string.IsNullOrWhiteSpace(run.BrowserSnapshot.DriverSessionId))
-        {
-            return false;
-        }
-
-        var url = ExtractUrl(content) ?? ExtractUrl(run.UserPrompt) ?? ExtractKnownSiteUrl(content) ?? ExtractKnownSiteUrl(run.UserPrompt);
-        if (url is null)
-        {
-            return false;
-        }
-
-        toolCall = new LlmToolCall
-        {
-            Index = 0,
-            Id = Guid.NewGuid().ToString("N"),
-            Name = "open_browser",
-            ArgumentsJson = new JsonObject
-            {
-                ["url"] = url,
-            }.ToJsonString(),
-        };
-
-        return true;
-    }
-
-    private static bool RequiresResumeNormalization(BrowserSessionSnapshot snapshot) =>
-        snapshot.RestoreStatus is not (RestoreStatus.NotStarted or RestoreStatus.Closed)
-        || !string.IsNullOrWhiteSpace(snapshot.CurrentUrl)
-        || !string.IsNullOrWhiteSpace(snapshot.PageTitle)
-        || !string.IsNullOrWhiteSpace(snapshot.DriverSessionId)
-        || !string.IsNullOrWhiteSpace(snapshot.DriverServiceUrl)
-        || snapshot.BrowserProcessId is not null
-        || snapshot.Tabs.Count > 0;
-
-    private static BrowserSessionSnapshot CloseSnapshot(BrowserSessionSnapshot snapshot) =>
-        new()
-        {
-            TestRunId = snapshot.TestRunId,
-            ProfilePath = snapshot.ProfilePath,
-            CurrentUrl = null,
-            PageTitle = null,
-            DriverSessionId = null,
-            DriverServiceUrl = null,
-            BrowserProcessId = null,
-            RestoreStatus = RestoreStatus.Closed,
-            LastCapturedAtUtc = DateTime.UtcNow,
-            Tabs = [],
-        };
-
-    private static bool TryInferNoArgumentToolCall(
-        string content,
-        IReadOnlyCollection<string> toolNames,
-        string toolName,
-        string phrase,
-        out LlmToolCall toolCall)
-    {
-        toolCall = default!;
-        if (!toolNames.Contains(toolName) || !content.Contains(phrase, StringComparison.OrdinalIgnoreCase))
-        {
-            return false;
-        }
-
-        toolCall = new LlmToolCall
-        {
-            Index = 0,
-            Id = Guid.NewGuid().ToString("N"),
-            Name = toolName,
-            ArgumentsJson = "{}",
-        };
-        return true;
-    }
-
-    private static string? ExtractUrl(string content)
-    {
-        var match = Regex.Match(content, @"https?://[^\s""')]+", RegexOptions.IgnoreCase);
-        return match.Success ? match.Value.TrimEnd('.', ',', ';') : null;
-    }
-
-    private static string? ExtractKnownSiteUrl(string content)
-    {
-        if (Regex.IsMatch(content, @"\bgoogle(?:\.com)?\b", RegexOptions.IgnoreCase))
-        {
-            return "https://www.google.com";
-        }
-
-        return null;
-    }
-
-    private static string RemoveSentenceContaining(string content, string token)
-    {
-        var sentences = Regex.Split(content, @"(?<=[.!?])\s+");
-        var filtered = sentences
-            .Where(sentence => !sentence.Contains(token, StringComparison.OrdinalIgnoreCase))
-            .ToArray();
-        return string.Join(' ', filtered).Trim();
-    }
-
     private static string BuildEmptyTurnNotice(int stalledTurns) =>
         stalledTurns switch
         {
@@ -1245,26 +664,6 @@ public sealed class ChatOrchestrator(
 
     private static string BuildPassiveToolLoopNotice(string toolName, int attemptCount) =>
         $"Passive tool loop detected after {attemptCount} consecutive passive calls ending with `{toolName}`. Use active_run.goals, active_run.browser, active_run.last_page_inspection, and active_run.recent_page_inspections from context instead of calling list_goals/open_browser/inspect_page again. The next tool should change page or goal state: create a missing distinct goal, type_ref, click_ref, mark_goal_pass, mark_goal_fail, or end_task when all goals are terminal.";
-
-    private static JsonNode CoerceTaggedValue(string rawValue)
-    {
-        if (bool.TryParse(rawValue, out var boolean))
-        {
-            return JsonValue.Create(boolean);
-        }
-
-        if (int.TryParse(rawValue, out var integer))
-        {
-            return JsonValue.Create(integer);
-        }
-
-        if (double.TryParse(rawValue, out var number))
-        {
-            return JsonValue.Create(number);
-        }
-
-        return JsonValue.Create(rawValue);
-    }
 
     private static JsonObject BuildToolResultMetadata(ToolExecutionResult result, int repeatedAttemptCount)
     {

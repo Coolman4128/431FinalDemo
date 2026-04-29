@@ -1,12 +1,11 @@
+#pragma warning disable CA1416
 using System.Security.Cryptography;
 using System.Text;
-using BrowserTesting.Core.Abstractions;
-using System.Runtime.Versioning;
+using BrowserTesting.Infrastructure.Persistence;
 
 namespace BrowserTesting.Infrastructure.Secrets;
 
-[SupportedOSPlatform("windows")]
-public sealed class DpapiSecretStore(IChatRepository repository) : ISecretStore
+public sealed class DpapiSecretStore(SqliteChatRepository repository)
 {
     public async Task SaveSecretAsync(Guid chatId, string name, string value, CancellationToken cancellationToken)
     {

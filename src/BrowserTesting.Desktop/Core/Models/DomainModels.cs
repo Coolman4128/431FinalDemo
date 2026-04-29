@@ -52,13 +52,9 @@ public sealed class GoalItem
 public sealed class BrowserSessionSnapshot
 {
     public Guid TestRunId { get; set; }
-    public string? ProfilePath { get; set; }
     public string? CurrentUrl { get; set; }
     public string? PageTitle { get; set; }
-    public string? DriverSessionId { get; set; }
-    public string? DriverServiceUrl { get; set; }
-    public int? BrowserProcessId { get; set; }
-    public RestoreStatus RestoreStatus { get; set; } = RestoreStatus.NotStarted;
+    public BrowserState State { get; set; } = BrowserState.NotStarted;
     public DateTime? LastCapturedAtUtc { get; set; }
     public List<BrowserTabInfo> Tabs { get; set; } = [];
 }
@@ -214,7 +210,7 @@ public sealed class AppSettings
 
         return new AppSettings
         {
-            DatabasePath = Path.Combine(appDataRoot, "browser-testing.db"),
+            DatabasePath = Path.Combine(appDataRoot, "browser-testing-v2.db"),
             ScreenshotDirectory = Path.Combine(appDataRoot, "Screenshots"),
             ChromeProfileRoot = Path.Combine(appDataRoot, "ChromeProfiles"),
             SettingsFilePath = Path.Combine(appDataRoot, "settings.json"),

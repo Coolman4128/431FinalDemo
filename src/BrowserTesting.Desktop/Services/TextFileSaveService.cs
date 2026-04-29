@@ -3,12 +3,7 @@ using Avalonia.Platform.Storage;
 
 namespace BrowserTesting.Desktop.Services;
 
-public interface ITextFileSaveService
-{
-    Task<string?> SaveTextAsync(string title, string suggestedFileName, string content, CancellationToken cancellationToken);
-}
-
-public sealed class TextFileSaveService(Window owner) : ITextFileSaveService
+public sealed class TextFileSaveService(Window owner)
 {
     public async Task<string?> SaveTextAsync(string title, string suggestedFileName, string content, CancellationToken cancellationToken)
     {

@@ -32,9 +32,8 @@ public partial class App : Application
             var repository = new SqliteChatRepository(settings);
             var browserSessionManager = new BrowserSessionManager(settings);
             var secretStore = new DpapiSecretStore(repository);
-            var goalService = new GoalService(repository);
             var toolRegistry = new ToolRegistry();
-            var toolExecutor = new ToolExecutor(browserSessionManager, goalService, repository, secretStore, toolRegistry);
+            var toolExecutor = new ToolExecutor(browserSessionManager, repository, secretStore, toolRegistry);
             var llmClient = new LmStudioLlmClient(new HttpClient
             {
                 Timeout = TimeSpan.FromMinutes(10),

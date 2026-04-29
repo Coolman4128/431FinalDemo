@@ -24,14 +24,12 @@ public enum TestRunStatus
     Cancelled = 5,
 }
 
-public enum RestoreStatus
+public enum BrowserState
 {
     NotStarted = 0,
     Active = 1,
-    RestoredBestEffort = 2,
-    RelaunchRequired = 3,
-    Failed = 4,
-    Closed = 5,
+    Closed = 2,
+    Failed = 3,
 }
 
 public enum TimelineItemKind

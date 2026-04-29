@@ -1,14 +1,12 @@
 using System.Data;
 using System.Globalization;
 using System.Text.Json;
-using System.Text.Json.Nodes;
-using BrowserTesting.Core.Abstractions;
 using BrowserTesting.Core.Models;
 using Microsoft.Data.Sqlite;
 
 namespace BrowserTesting.Infrastructure.Persistence;
 
-public sealed class SqliteChatRepository(AppSettings settings) : IChatRepository
+public sealed class SqliteChatRepository(AppSettings settings)
 {
     private readonly JsonSerializerOptions jsonOptions = new(JsonSerializerDefaults.Web);
     private readonly SemaphoreSlim databaseGate = new(1, 1);
@@ -789,123 +787,13 @@ public sealed class SqliteChatRepository(AppSettings settings) : IChatRepository
         }
         catch
         {
-            try
+            return new BrowserSessionSnapshot
             {
-                var node = JsonNode.Parse(json)?.AsObject();
-                return new BrowserSessionSnapshot
-                {
-                    TestRunId = TryGetGuid(node, "testRunId", "test_run_id") ?? runId,
-                    ProfilePath = TryGetString(node, "profilePath", "profile_path"),
-                    CurrentUrl = TryGetString(node, "currentUrl", "current_url"),
-                    PageTitle = TryGetString(node, "pageTitle", "page_title"),
-                    DriverSessionId = TryGetString(node, "driverSessionId", "driver_session_id"),
-                    DriverServiceUrl = TryGetString(node, "driverServiceUrl", "driver_service_url"),
-                    BrowserProcessId = TryGetInt(node, "browserProcessId", "browser_process_id"),
-                    RestoreStatus = TryGetRestoreStatus(node, "restoreStatus", "restore_status"),
-                    LastCapturedAtUtc = TryGetDate(node, "lastCapturedAtUtc", "last_captured_at_utc"),
-                    Tabs = ParseTabs(node?["tabs"]),
-                };
-            }
-            catch
-            {
-                return new BrowserSessionSnapshot
-                {
-                    TestRunId = runId,
-                    RestoreStatus = RestoreStatus.RelaunchRequired,
-                    LastCapturedAtUtc = DateTime.UtcNow,
-                };
-            }
+                TestRunId = runId,
+                State = BrowserState.Failed,
+                LastCapturedAtUtc = DateTime.UtcNow,
+            };
         }
-    }
-
-    private static string? TryGetString(JsonObject? node, params string[] names)
-    {
-        foreach (var name in names)
-        {
-            if (node?[name] is JsonValue value && value.TryGetValue<string>(out var result))
-            {
-                return result;
-            }
-        }
-
-        return null;
-    }
-
-    private static Guid? TryGetGuid(JsonObject? node, params string[] names)
-    {
-        var text = TryGetString(node, names);
-        return Guid.TryParse(text, out var guid) ? guid : null;
-    }
-
-    private static int? TryGetInt(JsonObject? node, params string[] names)
-    {
-        foreach (var name in names)
-        {
-            if (node?[name] is JsonValue value && value.TryGetValue<int>(out var result))
-            {
-                return result;
-            }
-        }
-
-        return null;
-    }
-
-    private static DateTime? TryGetDate(JsonObject? node, params string[] names)
-    {
-        var text = TryGetString(node, names);
-        if (string.IsNullOrWhiteSpace(text))
-        {
-            return null;
-        }
-
-        return DateTime.TryParse(text, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var parsed)
-            ? parsed
-            : null;
-    }
-
-    private static RestoreStatus TryGetRestoreStatus(JsonObject? node, params string[] names)
-    {
-        foreach (var name in names)
-        {
-            if (node?[name] is not JsonValue value)
-            {
-                continue;
-            }
-
-            if (value.TryGetValue<int>(out var integer) && Enum.IsDefined(typeof(RestoreStatus), integer))
-            {
-                return (RestoreStatus)integer;
-            }
-
-            if (value.TryGetValue<string>(out var text) && Enum.TryParse<RestoreStatus>(text, true, out var parsed))
-            {
-                return parsed;
-            }
-        }
-
-        return RestoreStatus.RelaunchRequired;
-    }
-
-    private static List<BrowserTabInfo> ParseTabs(JsonNode? node)
-    {
-        if (node is not JsonArray tabs)
-        {
-            return [];
-        }
-
-        var results = new List<BrowserTabInfo>();
-        foreach (var item in tabs.OfType<JsonObject>())
-        {
-            results.Add(new BrowserTabInfo
-            {
-                Handle = TryGetString(item, "handle") ?? string.Empty,
-                Title = TryGetString(item, "title"),
-                Url = TryGetString(item, "url"),
-                IsSelected = item["isSelected"]?.GetValue<bool>() ?? item["is_selected"]?.GetValue<bool>() ?? false,
-            });
-        }
-
-        return results;
     }
 
     private static DateTime ParseDate(string? value)

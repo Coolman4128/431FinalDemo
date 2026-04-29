@@ -1,24 +1,13 @@
-using BrowserTesting.Core.Abstractions;
 using BrowserTesting.Core.Models;
+using BrowserTesting.Infrastructure.Llm;
+using BrowserTesting.Infrastructure.Settings;
 
 namespace BrowserTesting.Desktop.Services;
 
-public interface ILlmSettingsService
-{
-    AppSettings Settings { get; }
-    Task<IReadOnlyList<string>> ListModelsAsync(LlmProvider provider, string? openAiApiKey, CancellationToken cancellationToken);
-    Task SaveAsync(
-        LlmProvider provider,
-        string? localModelName,
-        string? openAiModelName,
-        string? openAiApiKey,
-        CancellationToken cancellationToken);
-}
-
 public sealed class LlmSettingsService(
     AppSettings settings,
-    IAppSettingsStore settingsStore,
-    ILlmClient llmClient) : ILlmSettingsService
+    JsonAppSettingsStore settingsStore,
+    LmStudioLlmClient llmClient)
 {
     public AppSettings Settings => settings;
 

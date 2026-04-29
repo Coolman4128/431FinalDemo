@@ -1,6 +1,5 @@
 using System.Diagnostics;
 using System.Text.Json.Nodes;
-using BrowserTesting.Core.Abstractions;
 using BrowserTesting.Core.Models;
 using OpenQA.Selenium;
 using OpenQA.Selenium.Chrome;
@@ -8,30 +7,12 @@ using OpenQA.Selenium.Interactions;
 
 namespace BrowserTesting.Infrastructure.Browser;
 
-public sealed class BrowserSessionManager(AppSettings settings) : IBrowserSessionManager
+public sealed class BrowserSessionManager(AppSettings settings)
 {
     private readonly SemaphoreSlim sessionGate = new(1, 1);
     private readonly Dictionary<Guid, BrowserSessionSnapshot> snapshots = [];
     private readonly Dictionary<Guid, Dictionary<string, BrowserElementReference>> elementReferences = [];
     private BrowserSession? activeSession;
-
-    public async Task<BrowserSessionSnapshot> OpenBrowserAsync(Guid testRunId, string? startUrl, string profilePath, bool headless, CancellationToken cancellationToken)
-    {
-        return await RunLockedAsync(() =>
-        {
-            CloseActiveSessionLocked();
-
-            var session = CreateSession(testRunId, profilePath, headless);
-            activeSession = session;
-
-            if (!string.IsNullOrWhiteSpace(startUrl))
-            {
-                session.Driver.Navigate().GoToUrl(startUrl);
-            }
-
-            return CaptureAndCacheSnapshotLocked(session, RestoreStatus.Active);
-        }, cancellationToken);
-    }
 
     public async Task<BrowserSessionSnapshot?> GetSnapshotAsync(Guid testRunId, CancellationToken cancellationToken)
     {
@@ -44,7 +25,7 @@ public sealed class BrowserSessionManager(AppSettings settings) : IBrowserSessio
                     return MarkActiveSessionClosedLocked();
                 }
 
-                return CaptureAndCacheSnapshotLocked(activeSession, RestoreStatus.Active);
+                return CaptureAndCacheSnapshotLocked(activeSession, BrowserState.Active);
             }
 
             return snapshots.TryGetValue(testRunId, out var snapshot)
@@ -84,7 +65,7 @@ public sealed class BrowserSessionManager(AppSettings settings) : IBrowserSessio
                             elementReferences.Remove(testRunId);
                         }
 
-                        var currentSnapshot = CaptureAndCacheSnapshotLocked(activeSession, RestoreStatus.Active);
+                        var currentSnapshot = CaptureAndCacheSnapshotLocked(activeSession, BrowserState.Active);
                         return ToolExecutionResult.Successful(
                             "Chrome already open.",
                             SnapshotNode(currentSnapshot),
@@ -102,7 +83,7 @@ public sealed class BrowserSessionManager(AppSettings settings) : IBrowserSessio
                     session.Driver.Navigate().GoToUrl(startUrl);
                 }
 
-                var snapshot = CaptureAndCacheSnapshotLocked(session, RestoreStatus.Active);
+                var snapshot = CaptureAndCacheSnapshotLocked(session, BrowserState.Active);
                 return ToolExecutionResult.Successful("Chrome opened.", SnapshotNode(snapshot));
             }, cancellationToken);
         }
@@ -134,13 +115,13 @@ public sealed class BrowserSessionManager(AppSettings settings) : IBrowserSessio
                 var beforeUrl = SafeGet(() => driver.Url);
                 var result = toolName switch
                 {
-                    "list_tabs" => ToolExecutionResult.Successful("Tabs listed.", SnapshotNode(CaptureAndCacheSnapshotLocked(session, RestoreStatus.Active))),
+                    "list_tabs" => ToolExecutionResult.Successful("Tabs listed.", SnapshotNode(CaptureAndCacheSnapshotLocked(session, BrowserState.Active))),
                     "switch_tab" => SwitchTab(driver, arguments),
                     "goto_url" => NavigateTo(driver, arguments),
                     "back" => Navigate(driver, d => d.Navigate().Back(), "Navigated back."),
                     "forward" => Navigate(driver, d => d.Navigate().Forward(), "Navigated forward."),
                     "refresh" => Navigate(driver, d => d.Navigate().Refresh(), "Page refreshed."),
-                    "get_page_state" => ToolExecutionResult.Successful("Page state captured.", SnapshotNode(CaptureAndCacheSnapshotLocked(session, RestoreStatus.Active))),
+                    "get_page_state" => ToolExecutionResult.Successful("Page state captured.", SnapshotNode(CaptureAndCacheSnapshotLocked(session, BrowserState.Active))),
                     "find_element" => FindElement(driver, arguments, many: false),
                     "find_elements" => FindElement(driver, arguments, many: true),
                     "inspect_page" => InspectPage(testRunId, driver, arguments),
@@ -919,8 +900,7 @@ public sealed class BrowserSessionManager(AppSettings settings) : IBrowserSessio
         {
             ["current_url"] = Truncate(snapshot.CurrentUrl, 500),
             ["page_title"] = Truncate(snapshot.PageTitle, 300),
-            ["profile_path"] = snapshot.ProfilePath,
-            ["restore_status"] = snapshot.RestoreStatus.ToString(),
+            ["state"] = snapshot.State.ToString(),
             ["tabs"] = tabs,
         };
     }
@@ -930,9 +910,9 @@ public sealed class BrowserSessionManager(AppSettings settings) : IBrowserSessio
             ? result
             : null;
 
-    private BrowserSessionSnapshot CaptureAndCacheSnapshotLocked(BrowserSession session, RestoreStatus restoreStatus)
+    private BrowserSessionSnapshot CaptureAndCacheSnapshotLocked(BrowserSession session, BrowserState state)
     {
-        var snapshot = CaptureSnapshot(session, restoreStatus);
+        var snapshot = CaptureSnapshot(session, state);
         snapshots[session.TestRunId] = snapshot;
         return CloneSnapshot(snapshot);
     }
@@ -941,13 +921,13 @@ public sealed class BrowserSessionManager(AppSettings settings) : IBrowserSessio
     {
         if (activeSession is null)
         {
-            return new BrowserSessionSnapshot { RestoreStatus = RestoreStatus.Closed, LastCapturedAtUtc = DateTime.UtcNow };
+            return new BrowserSessionSnapshot { State = BrowserState.Closed, LastCapturedAtUtc = DateTime.UtcNow };
         }
 
         var session = activeSession;
         activeSession = null;
 
-        var snapshot = BuildClosedSnapshot(session.TestRunId, session.ProfilePath);
+        var snapshot = BuildClosedSnapshot(session.TestRunId);
         snapshots[session.TestRunId] = snapshot;
         DisposeSession(session);
         return CloneSnapshot(snapshot);
@@ -962,7 +942,7 @@ public sealed class BrowserSessionManager(AppSettings settings) : IBrowserSessio
 
         var session = activeSession;
         activeSession = null;
-        snapshots[session.TestRunId] = BuildClosedSnapshot(session.TestRunId, session.ProfilePath);
+        snapshots[session.TestRunId] = BuildClosedSnapshot(session.TestRunId);
         DisposeSession(session);
     }
 
@@ -1049,7 +1029,7 @@ public sealed class BrowserSessionManager(AppSettings settings) : IBrowserSessio
         return builder.Uri.AbsoluteUri.TrimEnd('/');
     }
 
-    private static BrowserSessionSnapshot CaptureSnapshot(BrowserSession session, RestoreStatus restoreStatus)
+    private static BrowserSessionSnapshot CaptureSnapshot(BrowserSession session, BrowserState state)
     {
         var driver = session.Driver;
         var tabs = new List<BrowserTabInfo>();
@@ -1075,29 +1055,21 @@ public sealed class BrowserSessionManager(AppSettings settings) : IBrowserSessio
         return new BrowserSessionSnapshot
         {
             TestRunId = session.TestRunId,
-            ProfilePath = session.ProfilePath,
             CurrentUrl = SafeGet(() => driver.Url),
             PageTitle = SafeGet(() => driver.Title),
-            DriverSessionId = session.Driver.SessionId?.ToString(),
-            DriverServiceUrl = session.Service.ServiceUrl?.ToString(),
-            BrowserProcessId = session.Service.ProcessId,
-            RestoreStatus = restoreStatus,
+            State = state,
             LastCapturedAtUtc = DateTime.UtcNow,
             Tabs = tabs,
         };
     }
 
-    private static BrowserSessionSnapshot BuildClosedSnapshot(Guid testRunId, string? profilePath) =>
+    private static BrowserSessionSnapshot BuildClosedSnapshot(Guid testRunId) =>
         new()
         {
             TestRunId = testRunId,
-            ProfilePath = profilePath,
             CurrentUrl = null,
             PageTitle = null,
-            DriverSessionId = null,
-            DriverServiceUrl = null,
-            BrowserProcessId = null,
-            RestoreStatus = RestoreStatus.Closed,
+            State = BrowserState.Closed,
             LastCapturedAtUtc = DateTime.UtcNow,
             Tabs = [],
         };
@@ -1107,10 +1079,7 @@ public sealed class BrowserSessionManager(AppSettings settings) : IBrowserSessio
         var copy = CloneSnapshot(snapshot);
         copy.CurrentUrl = null;
         copy.PageTitle = null;
-        copy.DriverSessionId = null;
-        copy.DriverServiceUrl = null;
-        copy.BrowserProcessId = null;
-        copy.RestoreStatus = RestoreStatus.Closed;
+        copy.State = BrowserState.Closed;
         copy.LastCapturedAtUtc = DateTime.UtcNow;
         copy.Tabs.Clear();
         return copy;
@@ -1120,13 +1089,9 @@ public sealed class BrowserSessionManager(AppSettings settings) : IBrowserSessio
         new()
         {
             TestRunId = snapshot.TestRunId,
-            ProfilePath = snapshot.ProfilePath,
             CurrentUrl = snapshot.CurrentUrl,
             PageTitle = snapshot.PageTitle,
-            DriverSessionId = snapshot.DriverSessionId,
-            DriverServiceUrl = snapshot.DriverServiceUrl,
-            BrowserProcessId = snapshot.BrowserProcessId,
-            RestoreStatus = snapshot.RestoreStatus,
+            State = snapshot.State,
             LastCapturedAtUtc = snapshot.LastCapturedAtUtc,
             Tabs = snapshot.Tabs.Select(tab => new BrowserTabInfo
             {
@@ -1139,7 +1104,7 @@ public sealed class BrowserSessionManager(AppSettings settings) : IBrowserSessio
 
     private static ToolExecutionResult CreateNoActiveBrowserResult(BrowserSessionSnapshot? persistedSnapshot)
     {
-        if (persistedSnapshot?.RestoreStatus == RestoreStatus.Closed)
+        if (persistedSnapshot?.State == BrowserState.Closed)
         {
             return ToolExecutionResult.Failed("Browser window is closed.", "Use `open_browser` to launch a new session.");
         }
