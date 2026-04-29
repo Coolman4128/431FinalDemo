@@ -1,7 +1,6 @@
 using System.Collections.ObjectModel;
-using BrowserTesting.Core.Models;
-using BrowserTesting.Core.Orchestration;
-using BrowserTesting.Core.Services;
+using BrowserTesting.Desktop.Models;
+using BrowserTesting.Desktop.Classes;
 using BrowserTesting.Desktop.Services;
 using Avalonia.Threading;
 

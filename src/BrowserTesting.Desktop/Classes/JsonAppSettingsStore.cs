@@ -3,9 +3,9 @@ using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
-using BrowserTesting.Core.Models;
+using BrowserTesting.Desktop.Models;
 
-namespace BrowserTesting.Infrastructure.Settings;
+namespace BrowserTesting.Desktop.Classes;
 
 public sealed class JsonAppSettingsStore
 {

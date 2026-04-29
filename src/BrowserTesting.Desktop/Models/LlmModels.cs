@@ -1,7 +1,6 @@
 using System.Text.Json.Nodes;
-using BrowserTesting.Core.Models;
 
-namespace BrowserTesting.Core.Llm;
+namespace BrowserTesting.Desktop.Models;
 
 public sealed class LlmConnectionSettings
 {

@@ -1,6 +1,6 @@
-using BrowserTesting.Core.Models;
+using BrowserTesting.Desktop.Models;
 
-namespace BrowserTesting.Core.Orchestration;
+namespace BrowserTesting.Desktop.Classes;
 
 public abstract record OrchestratorUpdate;
 

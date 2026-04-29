@@ -1,7 +1,7 @@
 using System.Text.Json.Nodes;
-using BrowserTesting.Core.Llm;
+using BrowserTesting.Desktop.Models;
 
-namespace BrowserTesting.Infrastructure.Tools;
+namespace BrowserTesting.Desktop.Classes;
 
 public sealed class ToolRegistry
 {

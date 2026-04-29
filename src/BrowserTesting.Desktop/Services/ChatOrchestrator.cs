@@ -1,16 +1,10 @@
 using System.Text;
 using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
-using BrowserTesting.Core.Llm;
-using BrowserTesting.Core.Models;
-using BrowserTesting.Core.Orchestration;
-using BrowserTesting.Infrastructure.Browser;
-using BrowserTesting.Infrastructure.Llm;
-using BrowserTesting.Infrastructure.Persistence;
-using BrowserTesting.Infrastructure.Secrets;
-using BrowserTesting.Infrastructure.Tools;
+using BrowserTesting.Desktop.Models;
+using BrowserTesting.Desktop.Classes;
 
-namespace BrowserTesting.Core.Services;
+namespace BrowserTesting.Desktop.Services;
 
 public sealed class ChatOrchestrator(
     SqliteChatRepository repository,

@@ -1,9 +1,8 @@
 #pragma warning disable CA1416
 using System.Security.Cryptography;
 using System.Text;
-using BrowserTesting.Infrastructure.Persistence;
 
-namespace BrowserTesting.Infrastructure.Secrets;
+namespace BrowserTesting.Desktop.Classes;
 
 public sealed class DpapiSecretStore(SqliteChatRepository repository)
 {

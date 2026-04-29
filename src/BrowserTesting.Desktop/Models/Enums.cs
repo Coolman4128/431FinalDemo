@@ -1,4 +1,4 @@
-namespace BrowserTesting.Core.Models;
+namespace BrowserTesting.Desktop.Models;
 
 public enum LlmProvider
 {

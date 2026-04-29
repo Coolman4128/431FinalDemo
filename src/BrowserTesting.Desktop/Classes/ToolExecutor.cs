@@ -1,12 +1,8 @@
 using System.Text.Json;
 using System.Text.Json.Nodes;
-using BrowserTesting.Core.Llm;
-using BrowserTesting.Core.Models;
-using BrowserTesting.Infrastructure.Browser;
-using BrowserTesting.Infrastructure.Persistence;
-using BrowserTesting.Infrastructure.Secrets;
+using BrowserTesting.Desktop.Models;
 
-namespace BrowserTesting.Infrastructure.Tools;
+namespace BrowserTesting.Desktop.Classes;
 
 public sealed class ToolExecutor(
     BrowserSessionManager browserSessionManager,

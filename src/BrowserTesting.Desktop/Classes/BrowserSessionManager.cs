@@ -1,11 +1,11 @@
 using System.Diagnostics;
 using System.Text.Json.Nodes;
-using BrowserTesting.Core.Models;
+using BrowserTesting.Desktop.Models;
 using OpenQA.Selenium;
 using OpenQA.Selenium.Chrome;
 using OpenQA.Selenium.Interactions;
 
-namespace BrowserTesting.Infrastructure.Browser;
+namespace BrowserTesting.Desktop.Classes;
 
 public sealed class BrowserSessionManager(AppSettings settings)
 {

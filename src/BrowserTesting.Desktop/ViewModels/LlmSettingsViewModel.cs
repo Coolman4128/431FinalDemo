@@ -1,6 +1,6 @@
 using System.Collections.ObjectModel;
 using System.Linq;
-using BrowserTesting.Core.Models;
+using BrowserTesting.Desktop.Models;
 using BrowserTesting.Desktop.Services;
 
 namespace BrowserTesting.Desktop.ViewModels;

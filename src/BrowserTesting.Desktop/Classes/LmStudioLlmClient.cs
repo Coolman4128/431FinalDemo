@@ -3,10 +3,9 @@ using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
-using BrowserTesting.Core.Llm;
-using BrowserTesting.Core.Models;
+using BrowserTesting.Desktop.Models;
 
-namespace BrowserTesting.Infrastructure.Llm;
+namespace BrowserTesting.Desktop.Classes;
 
 public sealed class LmStudioLlmClient(HttpClient httpClient)
 {

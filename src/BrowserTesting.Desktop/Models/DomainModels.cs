@@ -1,7 +1,6 @@
 using System.Text.Json.Nodes;
-using BrowserTesting.Core.Llm;
 
-namespace BrowserTesting.Core.Models;
+namespace BrowserTesting.Desktop.Models;
 
 public sealed class ChatSession
 {

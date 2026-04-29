@@ -1,10 +1,10 @@
 using System.Data;
 using System.Globalization;
 using System.Text.Json;
-using BrowserTesting.Core.Models;
+using BrowserTesting.Desktop.Models;
 using Microsoft.Data.Sqlite;
 
-namespace BrowserTesting.Infrastructure.Persistence;
+namespace BrowserTesting.Desktop.Classes;
 
 public sealed class SqliteChatRepository(AppSettings settings)
 {

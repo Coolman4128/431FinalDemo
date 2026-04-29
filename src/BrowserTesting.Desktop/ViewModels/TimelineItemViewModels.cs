@@ -1,5 +1,5 @@
 using System.Text.Json.Nodes;
-using BrowserTesting.Core.Models;
+using BrowserTesting.Desktop.Models;
 using Avalonia.Media;
 
 namespace BrowserTesting.Desktop.ViewModels;

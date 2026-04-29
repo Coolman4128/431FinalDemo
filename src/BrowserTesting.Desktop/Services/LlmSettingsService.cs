@@ -1,6 +1,5 @@
-using BrowserTesting.Core.Models;
-using BrowserTesting.Infrastructure.Llm;
-using BrowserTesting.Infrastructure.Settings;
+using BrowserTesting.Desktop.Models;
+using BrowserTesting.Desktop.Classes;
 
 namespace BrowserTesting.Desktop.Services;
 

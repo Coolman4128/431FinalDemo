@@ -1,14 +1,8 @@
-using BrowserTesting.Core.Models;
-using BrowserTesting.Core.Services;
+using BrowserTesting.Desktop.Models;
 using BrowserTesting.Desktop.Services;
 using BrowserTesting.Desktop.ViewModels;
 using BrowserTesting.Desktop.Views;
-using BrowserTesting.Infrastructure.Browser;
-using BrowserTesting.Infrastructure.Llm;
-using BrowserTesting.Infrastructure.Persistence;
-using BrowserTesting.Infrastructure.Secrets;
-using BrowserTesting.Infrastructure.Settings;
-using BrowserTesting.Infrastructure.Tools;
+using BrowserTesting.Desktop.Classes;
 using Avalonia;
 using Avalonia.Controls.ApplicationLifetimes;
 using Avalonia.Markup.Xaml;
