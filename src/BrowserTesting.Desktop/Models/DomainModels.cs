@@ -194,7 +194,6 @@ public sealed class AppSettings
     public int MaxToolIterations { get; set; } = 18;
     public bool LaunchHeadless { get; set; }
     public string DatabasePath { get; set; } = string.Empty;
-    public string ScreenshotDirectory { get; set; } = string.Empty;
     public string ChromeProfileRoot { get; set; } = string.Empty;
     public string SettingsFilePath { get; set; } = string.Empty;
 
@@ -306,7 +305,6 @@ public sealed class AppSettings
         return new AppSettings
         {
             DatabasePath = Path.Combine(appDataRoot, "browser-testing-v2.db"),
-            ScreenshotDirectory = Path.Combine(appDataRoot, "Screenshots"),
             ChromeProfileRoot = Path.Combine(appDataRoot, "ChromeProfiles"),
             SettingsFilePath = Path.Combine(appDataRoot, "settings.json"),
         };

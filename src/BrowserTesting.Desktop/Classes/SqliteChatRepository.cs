@@ -1,8 +1,6 @@
 ﻿#pragma warning disable CA1416
 using System.Data;
 using System.Globalization;
-using System.Security.Cryptography;
-using System.Text;
 using System.Text.Json;
 using BrowserTesting.Desktop.Models;
 using Microsoft.Data.Sqlite;
@@ -79,20 +77,10 @@ public sealed class SqliteChatRepository(AppSettings settings)
                     FOREIGN KEY(chat_id) REFERENCES chats(id)
                 );
 
-                CREATE TABLE IF NOT EXISTS secrets (
-                    chat_id TEXT NOT NULL,
-                    name TEXT NOT NULL,
-                    encrypted_value TEXT NOT NULL,
-                    updated_at_utc TEXT NOT NULL,
-                    PRIMARY KEY(chat_id, name),
-                    FOREIGN KEY(chat_id) REFERENCES chats(id)
-                );
-
                 CREATE INDEX IF NOT EXISTS ix_runs_chat_id ON runs(chat_id);
                 CREATE INDEX IF NOT EXISTS ix_goals_run_id ON goals(run_id);
                 CREATE INDEX IF NOT EXISTS ix_timeline_chat_sequence ON timeline_entries(chat_id, sequence_no);
                 CREATE INDEX IF NOT EXISTS ix_timeline_run_id ON timeline_entries(run_id);
-                CREATE INDEX IF NOT EXISTS ix_secrets_chat_id ON secrets(chat_id);
                 """;
 
             await command.ExecuteNonQueryAsync(token);
@@ -434,54 +422,6 @@ public sealed class SqliteChatRepository(AppSettings settings)
             await command.ExecuteNonQueryAsync(token);
         }, cancellationToken);
 
-    public Task SaveSecretAsync(Guid chatId, string name, string value, CancellationToken cancellationToken) =>
-        UseTransactionAsync(async (connection, transaction, token) =>
-        {
-            var command = CreateCommand(connection, transaction);
-            command.CommandText =
-                """
-                INSERT INTO secrets (chat_id, name, encrypted_value, updated_at_utc)
-                VALUES (@chat_id, @name, @encrypted_value, @updated_at_utc)
-                ON CONFLICT(chat_id, name)
-                DO UPDATE SET encrypted_value = excluded.encrypted_value,
-                              updated_at_utc = excluded.updated_at_utc;
-                """;
-            Add(command, "@chat_id", chatId);
-            Add(command, "@name", name.Trim());
-            Add(command, "@encrypted_value", EncryptSecret(value));
-            Add(command, "@updated_at_utc", DateTime.UtcNow);
-            await command.ExecuteNonQueryAsync(token);
-        }, cancellationToken);
-
-    public Task<string?> GetSecretAsync(Guid chatId, string name, CancellationToken cancellationToken) =>
-        UseConnectionAsync<string?>(async (connection, token) =>
-        {
-            var command = connection.CreateCommand();
-            command.CommandText = "SELECT encrypted_value FROM secrets WHERE chat_id = @chat_id AND name = @name;";
-            Add(command, "@chat_id", chatId);
-            Add(command, "@name", name.Trim());
-            var result = await command.ExecuteScalarAsync(token);
-            return result is string encryptedValue
-                ? DecryptSecret(encryptedValue)
-                : null;
-        }, cancellationToken);
-
-    public Task<IReadOnlyList<string>> ListSecretNamesAsync(Guid chatId, CancellationToken cancellationToken) =>
-        UseConnectionAsync<IReadOnlyList<string>>(async (connection, token) =>
-        {
-            var results = new List<string>();
-            var command = connection.CreateCommand();
-            command.CommandText = "SELECT name FROM secrets WHERE chat_id = @chat_id ORDER BY name;";
-            Add(command, "@chat_id", chatId);
-            await using var reader = await command.ExecuteReaderAsync(token);
-            while (await reader.ReadAsync(token))
-            {
-                results.Add(reader.GetString(0));
-            }
-
-            return results;
-        }, cancellationToken);
-
     private async Task<SqliteConnection> OpenConnectionAsync(CancellationToken cancellationToken)
     {
         var connection = new SqliteConnection(connectionString);
@@ -775,20 +715,6 @@ public sealed class SqliteChatRepository(AppSettings settings)
 
     private string Serialize<T>(T value) =>
         JsonSerializer.Serialize(value, jsonOptions);
-
-    private static string EncryptSecret(string value)
-    {
-        var clearBytes = Encoding.UTF8.GetBytes(value);
-        var encrypted = ProtectedData.Protect(clearBytes, null, DataProtectionScope.CurrentUser);
-        return Convert.ToBase64String(encrypted);
-    }
-
-    private static string DecryptSecret(string encryptedValue)
-    {
-        var encryptedBytes = Convert.FromBase64String(encryptedValue);
-        var clearBytes = ProtectedData.Unprotect(encryptedBytes, null, DataProtectionScope.CurrentUser);
-        return Encoding.UTF8.GetString(clearBytes);
-    }
 
     private BrowserSessionSnapshot DeserializeSnapshot(string? json, Guid runId)
     {

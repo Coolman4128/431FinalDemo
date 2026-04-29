@@ -5,21 +5,17 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Windows.Input;
-using BrowserTesting.Desktop.Models;
-using BrowserTesting.Desktop.Classes;
-using BrowserTesting.Desktop.Services;
 using Avalonia.Media;
 using Avalonia.Threading;
+using BrowserTesting.Desktop.Classes;
+using BrowserTesting.Desktop.Models;
+using BrowserTesting.Desktop.Services;
 
 namespace BrowserTesting.Desktop.ViewModels;
 
 public sealed class MainWindowViewModel : ObservableObject
 {
-    private static readonly JsonSerializerOptions TranscriptJsonOptions = new()
-    {
-        WriteIndented = true,
-    };
-
+    private static readonly JsonSerializerOptions TranscriptJsonOptions = new() { WriteIndented = true };
     private readonly ChatOrchestrator orchestrator;
     private readonly Func<string, string, string, CancellationToken, Task<string?>> saveTextAsync;
     private readonly AppSettings settings;
@@ -35,12 +31,12 @@ public sealed class MainWindowViewModel : ObservableObject
     private string selectedRunTitle = "Draft conversation";
     private string statusText = "Ready";
     private string providerModelStatusText = string.Empty;
+    private string selectionTranscriptText = string.Empty;
     private Guid? selectedChatId;
     private Guid? selectedRunId;
     private Guid? loadingChatId;
     private bool suppressSelectedChatLoad;
     private bool isSelectionModeEnabled;
-    private string selectionTranscriptText = string.Empty;
 
     public MainWindowViewModel(
         ChatOrchestrator orchestrator,
@@ -53,16 +49,12 @@ public sealed class MainWindowViewModel : ObservableObject
         this.saveTextAsync = saveTextAsync;
         this.settings = settings;
         this.uiDispatcher = uiDispatcher ?? DispatchToUiThread;
-
-        Settings = new LlmSettingsViewModel(settings, llmClient);
+        Settings = new(settings, llmClient);
         Settings.PropertyChanged += (_, args) =>
         {
             if (args.PropertyName is nameof(LlmSettingsViewModel.IsOpen))
             {
-                RaisePropertyChanged(nameof(IsTimelineVisible));
-                RaisePropertyChanged(nameof(IsDraftWorkspaceVisible));
-                RaisePropertyChanged(nameof(IsSelectionTranscriptVisible));
-                RaisePropertyChanged(nameof(IsComposerVisible));
+                RaiseWorkspaceProperties();
             }
         };
         Settings.Completed += message => this.uiDispatcher(() =>
@@ -70,11 +62,9 @@ public sealed class MainWindowViewModel : ObservableObject
             StatusText = message;
             RefreshProviderModelStatusText();
         });
-
-        NewChatCommand = new AsyncRelayCommand(SelectDraftChatAsync);
-        SendCommand = new AsyncRelayCommand(SendAsync, () => !string.IsNullOrWhiteSpace(ComposerText));
-        ExportChatCommand = new AsyncRelayCommand(ExportChatAsync, () => CanExportSelectedChat());
-
+        NewChatCommand = new(SelectDraftChatAsync);
+        SendCommand = new(SendAsync, () => !string.IsNullOrWhiteSpace(ComposerText));
+        ExportChatCommand = new(ExportChatAsync, CanExportSelectedChat);
         RefreshProviderModelStatusText();
         InitializationTask = InitializeAsync();
     }
@@ -100,22 +90,15 @@ public sealed class MainWindowViewModel : ObservableObject
 
             UpdateChatSelectionState();
             ExportChatCommand.RaiseCanExecuteChanged();
-            RaisePropertyChanged(nameof(IsDraftSelected));
-            RaisePropertyChanged(nameof(IsTimelineVisible));
-            RaisePropertyChanged(nameof(IsDraftWorkspaceVisible));
-
+            RaiseWorkspaceProperties(nameof(IsDraftSelected));
             if (suppressSelectedChatLoad)
             {
                 return;
             }
 
-            if (value is null || value.IsDraft || value.Id is null)
-            {
-                _ = TransitionToDraftWorkspaceAsync();
-                return;
-            }
-
-            _ = SwitchToChatAsync(value.Id.Value);
+            _ = value is { IsDraft: false, Id: Guid chatId }
+                ? SwitchToChatAsync(chatId)
+                : TransitionToDraftWorkspaceAsync();
         }
     }
 
@@ -152,9 +135,7 @@ public sealed class MainWindowViewModel : ObservableObject
         {
             if (SetProperty(ref isSelectionModeEnabled, value))
             {
-                RaisePropertyChanged(nameof(IsTimelineVisible));
-                RaisePropertyChanged(nameof(IsDraftWorkspaceVisible));
-                RaisePropertyChanged(nameof(IsSelectionTranscriptVisible));
+                RaiseWorkspaceProperties();
             }
         }
     }
@@ -162,8 +143,7 @@ public sealed class MainWindowViewModel : ObservableObject
     private async Task InitializeAsync()
     {
         await orchestrator.InitializeAsync(CancellationToken.None);
-        var chats = await orchestrator.ListChatsAsync(CancellationToken.None);
-        ReplaceChats(chats);
+        ReplaceChats(await orchestrator.ListChatsAsync(CancellationToken.None));
         SelectChatWithoutLoading(draftChatItem);
         ResetDraftWorkspace("Ready");
     }
@@ -188,10 +168,8 @@ public sealed class MainWindowViewModel : ObservableObject
             return;
         }
 
-        loadingChatId = chatId;
-        selectedChatId = chatId;
+        loadingChatId = selectedChatId = chatId;
         StatusText = "Loading chat...";
-
         try
         {
             var chat = await orchestrator.LoadChatAsync(chatId, ApplyUpdate, CancellationToken.None);
@@ -211,10 +189,9 @@ public sealed class MainWindowViewModel : ObservableObject
 
     private async Task SwitchToChatAsync(Guid chatId)
     {
-        var previousRunId = selectedRunId;
-        if (previousRunId is not null)
+        if (selectedRunId is { } runId)
         {
-            await orchestrator.CloseBrowserAsync(previousRunId.Value, ApplyUpdate, CancellationToken.None);
+            await orchestrator.CloseBrowserAsync(runId, ApplyUpdate, CancellationToken.None);
         }
 
         await LoadChatAsync(chatId);
@@ -222,10 +199,9 @@ public sealed class MainWindowViewModel : ObservableObject
 
     private async Task TransitionToDraftWorkspaceAsync()
     {
-        var previousRunId = selectedRunId;
-        if (previousRunId is not null)
+        if (selectedRunId is { } runId)
         {
-            await orchestrator.CloseBrowserAsync(previousRunId.Value, ApplyUpdate, CancellationToken.None);
+            await orchestrator.CloseBrowserAsync(runId, ApplyUpdate, CancellationToken.None);
         }
 
         ResetDraftWorkspace("New chat draft ready.");
@@ -271,15 +247,10 @@ public sealed class MainWindowViewModel : ObservableObject
                 return;
             }
 
-            var filePath = await saveTextAsync(
-                "Export chat history",
-                BuildExportFileName(chat),
-                FormatTranscriptForExport(chat),
-                CancellationToken.None);
-
-            if (filePath is not null)
+            var path = await saveTextAsync("Export chat history", BuildExportFileName(chat), FormatTranscriptForExport(chat), CancellationToken.None);
+            if (path is not null)
             {
-                StatusText = $"Chat exported to {filePath}";
+                StatusText = $"Chat exported to {path}";
             }
         }
         catch (Exception ex)
@@ -288,68 +259,50 @@ public sealed class MainWindowViewModel : ObservableObject
         }
     }
 
-    private void ApplyUpdate(OrchestratorUpdate update) =>
-        uiDispatcher(() =>
+    private void ApplyUpdate(OrchestratorUpdate update) => uiDispatcher(() =>
+    {
+        switch (update)
         {
-            switch (update)
-            {
-                case ChatLoaded loaded when selectedChatId == loaded.Chat.Id:
-                    ApplyChat(loaded.Chat, "Chat loaded.");
-                    break;
-
-                case TimelineEntryUpserted timelineUpdate:
-                    UpsertTimeline(timelineUpdate.Entry);
-                    break;
-
-                case BrowserSnapshotUpdated browserUpdate:
-                    if (selectedRunId == browserUpdate.RunId)
-                    {
-                        ApplyBrowserSnapshot(browserUpdate.Snapshot);
-                    }
-                    break;
-
-                case GoalsUpdated goalsUpdate:
-                    if (selectedRunId == goalsUpdate.RunId)
-                    {
-                        ApplyGoals(goalsUpdate.Goals);
-                    }
-                    break;
-
-                case RunUpdated runUpdate:
-                    ApplyRun(runUpdate.Run);
-                    break;
-
-                case OrchestrationError error:
-                    StatusText = error.Message;
-                    break;
-            }
-        });
+            case ChatLoaded loaded when selectedChatId == loaded.Chat.Id:
+                ApplyChat(loaded.Chat, "Chat loaded.");
+                break;
+            case TimelineEntryUpserted timelineUpdate:
+                UpsertTimeline(timelineUpdate.Entry);
+                break;
+            case BrowserSnapshotUpdated browserUpdate when selectedRunId == browserUpdate.RunId:
+                ApplyBrowserSnapshot(browserUpdate.Snapshot);
+                break;
+            case GoalsUpdated goalsUpdate when selectedRunId == goalsUpdate.RunId:
+                ApplyGoals(goalsUpdate.Goals);
+                break;
+            case RunUpdated runUpdate:
+                ApplyRun(runUpdate.Run);
+                break;
+            case OrchestrationError error:
+                StatusText = error.Message;
+                break;
+        }
+    });
 
     private void ApplyChat(ChatSession chat, string statusMessage)
     {
         currentChat = chat;
         selectedChatId = chat.Id;
-
-        var savedChat = UpsertChatSummary(chat);
-        SelectChatWithoutLoading(savedChat);
+        SelectChatWithoutLoading(UpsertChatSummary(chat));
         RebuildTimeline();
-
-        var run = chat.Runs
-            .OrderByDescending(candidate => candidate.UpdatedAtUtc)
-            .FirstOrDefault();
-
-        if (run is not null)
-        {
-            ApplyRun(run);
-            ApplyGoals(run.Goals);
-            ApplyBrowserSnapshot(run.BrowserSnapshot);
-        }
-        else
+        var run = chat.Runs.OrderByDescending(candidate => candidate.UpdatedAtUtc).FirstOrDefault();
+        if (run is null)
         {
             selectedRunId = null;
             Goals.Clear();
             ResetBrowserSummary();
             SelectedRunTitle = "No run selected";
+        }
+        else
+        {
+            ApplyRun(run);
+            ApplyGoals(run.Goals);
+            ApplyBrowserSnapshot(run.BrowserSnapshot);
         }
 
         RefreshSelectionTranscript();
@@ -369,15 +322,7 @@ public sealed class MainWindowViewModel : ObservableObject
         Goals.Clear();
         foreach (var goal in goals.OrderBy(item => item.CreatedAtUtc))
         {
-            Goals.Add(new GoalItemViewModel
-            {
-                Id = goal.Id,
-                Title = goal.Title,
-                SuccessCriteria = goal.SuccessCriteria,
-                Status = goal.Status,
-                Note = goal.Note,
-                Evidence = goal.Evidence,
-            });
+            Goals.Add(new() { Id = goal.Id, Title = goal.Title, SuccessCriteria = goal.SuccessCriteria, Status = goal.Status, Note = goal.Note, Evidence = goal.Evidence });
         }
     }
 
@@ -400,16 +345,9 @@ public sealed class MainWindowViewModel : ObservableObject
     {
         Chats.Clear();
         Chats.Add(draftChatItem);
-
         foreach (var chat in chats.OrderByDescending(item => item.UpdatedAtUtc))
         {
-            Chats.Add(new ChatListItemViewModel
-            {
-                Id = chat.Id,
-                Title = chat.Title,
-                UpdatedAtUtc = chat.UpdatedAtUtc,
-                ActiveRuns = chat.ActiveRuns,
-            });
+            Chats.Add(new() { Id = chat.Id, Title = chat.Title, UpdatedAtUtc = chat.UpdatedAtUtc, ActiveRuns = chat.ActiveRuns });
         }
 
         UpdateChatSelectionState();
@@ -419,17 +357,10 @@ public sealed class MainWindowViewModel : ObservableObject
     {
         var activeRuns = chat.Runs.Count(run => run.Status is TestRunStatus.Pending or TestRunStatus.Running or TestRunStatus.WaitingForTool);
         var current = Chats.FirstOrDefault(item => !item.IsDraft && item.Id == chat.Id);
-
         if (current is null)
         {
-            current = new ChatListItemViewModel
-            {
-                Id = chat.Id,
-                Title = chat.Title,
-                UpdatedAtUtc = chat.UpdatedAtUtc,
-                ActiveRuns = activeRuns,
-            };
-            InsertSavedChatItemSorted(current);
+            current = new() { Id = chat.Id, Title = chat.Title, UpdatedAtUtc = chat.UpdatedAtUtc, ActiveRuns = activeRuns };
+            Chats.Insert(GetSortedInsertIndex(current), current);
         }
         else
         {
@@ -442,33 +373,15 @@ public sealed class MainWindowViewModel : ObservableObject
         return current;
     }
 
-    private void InsertSavedChatItemSorted(ChatListItemViewModel item)
-    {
-        var insertIndex = GetSortedInsertIndex(item);
-        Chats.Insert(insertIndex, item);
-    }
-
     private int GetSortedInsertIndex(ChatListItemViewModel item)
     {
-        var insertIndex = 1;
-        while (insertIndex < Chats.Count)
+        var index = 1;
+        while (index < Chats.Count && (ReferenceEquals(Chats[index], item) || Chats[index].UpdatedAtUtc > item.UpdatedAtUtc))
         {
-            var candidate = Chats[insertIndex];
-            if (ReferenceEquals(candidate, item))
-            {
-                insertIndex++;
-                continue;
-            }
-
-            if (candidate.UpdatedAtUtc <= item.UpdatedAtUtc)
-            {
-                break;
-            }
-
-            insertIndex++;
+            index++;
         }
 
-        return insertIndex;
+        return index;
     }
 
     private void UpsertTimeline(TimelineEntry entry)
@@ -478,28 +391,33 @@ public sealed class MainWindowViewModel : ObservableObject
             return;
         }
 
-        var currentEntry = currentChat.Timeline.FirstOrDefault(item => item.Id == entry.Id);
-        if (currentEntry is null)
+        var current = currentChat.Timeline.FirstOrDefault(item => item.Id == entry.Id);
+        if (current is null)
         {
             currentChat.Timeline.Add(entry);
         }
         else
         {
-            currentEntry.Sequence = entry.Sequence;
-            currentEntry.Kind = entry.Kind;
-            currentEntry.Role = entry.Role;
-            currentEntry.Content = entry.Content;
-            currentEntry.ToolCallId = entry.ToolCallId;
-            currentEntry.ToolName = entry.ToolName;
-            currentEntry.MetadataJson = entry.MetadataJson;
-            currentEntry.CreatedAtUtc = entry.CreatedAtUtc;
-            currentEntry.TestRunId = entry.TestRunId;
+            CopyTimelineEntry(entry, current);
         }
 
         currentChat.UpdatedAtUtc = DateTime.UtcNow;
         UpsertChatSummary(currentChat);
         RefreshSelectionTranscript();
         RebuildTimeline();
+    }
+
+    private static void CopyTimelineEntry(TimelineEntry source, TimelineEntry target)
+    {
+        target.Sequence = source.Sequence;
+        target.Kind = source.Kind;
+        target.Role = source.Role;
+        target.Content = source.Content;
+        target.ToolCallId = source.ToolCallId;
+        target.ToolName = source.ToolName;
+        target.MetadataJson = source.MetadataJson;
+        target.CreatedAtUtc = source.CreatedAtUtc;
+        target.TestRunId = source.TestRunId;
     }
 
     private void RebuildTimeline()
@@ -510,73 +428,38 @@ public sealed class MainWindowViewModel : ObservableObject
             return;
         }
 
-        var toolItemsByCallId = new Dictionary<string, TimelineItemViewModel>(StringComparer.Ordinal);
-
+        var toolsByCallId = new Dictionary<string, TimelineItemViewModel>(StringComparer.Ordinal);
         foreach (var entry in currentChat.Timeline.OrderBy(item => item.Sequence))
         {
-            switch (entry.Kind)
+            if (entry.Kind == TimelineItemKind.ToolCallFinished)
             {
-                case TimelineItemKind.UserMessage:
-                    Timeline.Add(new TimelineItemViewModel(entry));
-                    break;
-
-                case TimelineItemKind.AssistantMessage:
-                    Timeline.Add(new TimelineItemViewModel(entry));
-                    break;
-
-                case TimelineItemKind.ToolCallStarted:
+                var key = entry.ToolCallId ?? entry.Id.ToString("N");
+                if (!toolsByCallId.TryGetValue(key, out var item))
                 {
-                    var toolItem = new TimelineItemViewModel(entry);
-                    toolItemsByCallId[toolItem.ItemKey] = toolItem;
-                    Timeline.Add(toolItem);
-                    break;
+                    item = new(entry);
+                    toolsByCallId[item.ItemKey] = item;
+                    Timeline.Add(item);
                 }
 
-                case TimelineItemKind.ToolCallFinished:
-                {
-                    var itemKey = entry.ToolCallId ?? entry.Id.ToString("N");
-                    if (toolItemsByCallId.TryGetValue(itemKey, out var existing))
-                    {
-                        existing.ApplyFinishedEntry(entry);
-                    }
-                    else
-                    {
-                        var toolItem = new TimelineItemViewModel(entry);
-                        toolItem.ApplyFinishedEntry(entry);
-                        toolItemsByCallId[toolItem.ItemKey] = toolItem;
-                        Timeline.Add(toolItem);
-                    }
-
-                    break;
-                }
-
-                case TimelineItemKind.GoalChanged:
-                    Timeline.Add(new TimelineItemViewModel(entry));
-                    break;
-
-                default:
-                    Timeline.Add(new TimelineItemViewModel(entry));
-                    break;
+                item.ApplyFinishedEntry(entry);
+                continue;
             }
+
+            var timelineItem = new TimelineItemViewModel(entry);
+            if (entry.Kind == TimelineItemKind.ToolCallStarted)
+            {
+                toolsByCallId[timelineItem.ItemKey] = timelineItem;
+            }
+
+            Timeline.Add(timelineItem);
         }
     }
-
-    private void RefreshSelectionTranscript() =>
-        SelectionTranscriptText = currentChat is null
-            ? string.Empty
-            : FormatTranscriptForSelection(currentChat);
 
     private void SelectChatWithoutLoading(ChatListItemViewModel chatItem)
     {
         suppressSelectedChatLoad = true;
-        try
-        {
-            SelectedChat = chatItem;
-        }
-        finally
-        {
-            suppressSelectedChatLoad = false;
-        }
+        try { SelectedChat = chatItem; }
+        finally { suppressSelectedChatLoad = false; }
     }
 
     private void UpdateChatSelectionState()
@@ -590,9 +473,7 @@ public sealed class MainWindowViewModel : ObservableObject
     private void ResetDraftWorkspace(string statusMessage)
     {
         currentChat = null;
-        selectedChatId = null;
-        selectedRunId = null;
-        loadingChatId = null;
+        selectedChatId = selectedRunId = loadingChatId = null;
         ComposerText = string.Empty;
         Timeline.Clear();
         Goals.Clear();
@@ -614,46 +495,40 @@ public sealed class MainWindowViewModel : ObservableObject
 
     private void RefreshProviderModelStatusText()
     {
-        var providerLabel = settings.Provider == LlmProvider.OpenAi ? "OpenAI" : "Local";
-        var modelName = string.IsNullOrWhiteSpace(settings.CurrentModelName) ? "No model selected" : settings.CurrentModelName;
-        ProviderModelStatusText = $"{providerLabel} | {modelName}";
+        var provider = settings.Provider == LlmProvider.OpenAi ? "OpenAI" : "Local";
+        var model = string.IsNullOrWhiteSpace(settings.CurrentModelName) ? "No model selected" : settings.CurrentModelName;
+        ProviderModelStatusText = $"{provider} | {model}";
     }
+
+    private void RefreshSelectionTranscript() =>
+        SelectionTranscriptText = currentChat is null ? string.Empty : FormatTranscriptForSelection(currentChat);
+
+    private void RaiseWorkspaceProperties(params string[] extra) =>
+        RaisePropertiesChanged([nameof(IsTimelineVisible), nameof(IsDraftWorkspaceVisible), nameof(IsSelectionTranscriptVisible), nameof(IsComposerVisible), .. extra]);
 
     private static void DispatchToUiThread(Action action)
     {
         if (Dispatcher.UIThread.CheckAccess())
         {
             action();
-            return;
         }
-
-        Dispatcher.UIThread.Post(action);
+        else
+        {
+            Dispatcher.UIThread.Post(action);
+        }
     }
 
     private static string FormatTranscriptForSelection(ChatSession chat)
     {
-        var builder = new StringBuilder();
-        builder.AppendLine($"Chat: {chat.Title}");
-        builder.AppendLine($"Chat Id: {chat.Id}");
-        builder.AppendLine();
-
+        var builder = new StringBuilder()
+            .AppendLine($"Chat: {chat.Title}")
+            .AppendLine($"Chat Id: {chat.Id}")
+            .AppendLine();
         foreach (var entry in chat.Timeline.OrderBy(item => item.Sequence))
         {
-            builder.Append('[')
-                .Append(entry.CreatedAtUtc.ToLocalTime().ToString("g"))
-                .Append("] ")
-                .AppendLine(BuildTranscriptEntryHeading(entry));
-
-            if (!string.IsNullOrWhiteSpace(entry.Content))
-            {
-                builder.AppendLine(entry.Content.TrimEnd());
-            }
-
-            if (!string.IsNullOrWhiteSpace(entry.ToolName))
-            {
-                builder.Append("Tool: ").AppendLine(entry.ToolName);
-            }
-
+            builder.Append('[').Append(entry.CreatedAtUtc.ToLocalTime().ToString("g")).Append("] ").AppendLine(BuildTranscriptEntryHeading(entry));
+            AppendOptionalLine(builder, entry.Content?.TrimEnd());
+            AppendOptionalPair(builder, "Tool", entry.ToolName);
             if (!string.IsNullOrWhiteSpace(entry.MetadataJson))
             {
                 builder.AppendLine("Metadata:");
@@ -669,17 +544,9 @@ public sealed class MainWindowViewModel : ObservableObject
     private static string FormatTranscriptForExport(ChatSession chat)
     {
         var builder = new StringBuilder();
-        builder.AppendLine("Chat Export");
-        builder.AppendLine("===========");
-        builder.Append("Exported At (UTC): ").AppendLine(DateTime.UtcNow.ToString("O"));
-        builder.Append("Chat Id: ").AppendLine(chat.Id.ToString());
-        builder.Append("Title: ").AppendLine(chat.Title);
-        builder.Append("Created At (UTC): ").AppendLine(chat.CreatedAtUtc.ToString("O"));
-        builder.Append("Updated At (UTC): ").AppendLine(chat.UpdatedAtUtc.ToString("O"));
-        builder.AppendLine();
-
-        builder.AppendLine("Runs");
-        builder.AppendLine("----");
+        builder.AppendLine("Chat Export").AppendLine("===========");
+        AppendPairs(builder, ("Exported At (UTC)", DateTime.UtcNow.ToString("O")), ("Chat Id", chat.Id.ToString()), ("Title", chat.Title), ("Created At (UTC)", chat.CreatedAtUtc.ToString("O")), ("Updated At (UTC)", chat.UpdatedAtUtc.ToString("O")));
+        builder.AppendLine().AppendLine("Runs").AppendLine("----");
         if (chat.Runs.Count == 0)
         {
             builder.AppendLine("(none)");
@@ -689,42 +556,15 @@ public sealed class MainWindowViewModel : ObservableObject
             foreach (var run in chat.Runs.OrderBy(item => item.CreatedAtUtc))
             {
                 builder.AppendLine($"Run {run.Id}");
-                builder.Append("Prompt: ").AppendLine(run.UserPrompt);
-                builder.Append("Status: ").AppendLine(run.Status.ToString());
-                builder.Append("Failure Reason: ").AppendLine(run.FailureReason ?? "(none)");
-                builder.Append("Created At (UTC): ").AppendLine(run.CreatedAtUtc.ToString("O"));
-                builder.Append("Updated At (UTC): ").AppendLine(run.UpdatedAtUtc.ToString("O"));
-                builder.Append("Completed At (UTC): ").AppendLine(run.CompletedAtUtc?.ToString("O") ?? "(not completed)");
+                AppendPairs(builder, ("Prompt", run.UserPrompt), ("Status", run.Status.ToString()), ("Failure Reason", run.FailureReason ?? "(none)"), ("Created At (UTC)", run.CreatedAtUtc.ToString("O")), ("Updated At (UTC)", run.UpdatedAtUtc.ToString("O")), ("Completed At (UTC)", run.CompletedAtUtc?.ToString("O") ?? "(not completed)"));
                 builder.AppendLine("Browser Snapshot:");
                 AppendMultiline(builder, JsonSerializer.Serialize(run.BrowserSnapshot, TranscriptJsonOptions), "  ");
-                builder.AppendLine("Goals:");
-
-                if (run.Goals.Count == 0)
-                {
-                    builder.AppendLine("  (none)");
-                }
-                else
-                {
-                    foreach (var goal in run.Goals.OrderBy(item => item.CreatedAtUtc))
-                    {
-                        builder.Append("  - Goal Id: ").AppendLine(goal.Id.ToString());
-                        builder.Append("    Title: ").AppendLine(goal.Title);
-                        builder.Append("    Success Criteria: ").AppendLine(goal.SuccessCriteria);
-                        builder.Append("    Status: ").AppendLine(goal.Status.ToString());
-                        builder.Append("    Note: ").AppendLine(goal.Note ?? "(none)");
-                        builder.Append("    Evidence: ").AppendLine(goal.Evidence ?? "(none)");
-                        builder.Append("    Created At (UTC): ").AppendLine(goal.CreatedAtUtc.ToString("O"));
-                        builder.Append("    Updated At (UTC): ").AppendLine(goal.UpdatedAtUtc.ToString("O"));
-                        builder.Append("    Completed At (UTC): ").AppendLine(goal.CompletedAtUtc?.ToString("O") ?? "(not completed)");
-                    }
-                }
-
+                AppendGoals(builder, run.Goals);
                 builder.AppendLine();
             }
         }
 
-        builder.AppendLine("Timeline");
-        builder.AppendLine("--------");
+        builder.AppendLine("Timeline").AppendLine("--------");
         if (chat.Timeline.Count == 0)
         {
             builder.AppendLine("(none)");
@@ -734,13 +574,7 @@ public sealed class MainWindowViewModel : ObservableObject
             foreach (var entry in chat.Timeline.OrderBy(item => item.Sequence))
             {
                 builder.Append('[').Append(entry.Sequence).AppendLine("]");
-                builder.Append("Entry Id: ").AppendLine(entry.Id.ToString());
-                builder.Append("Run Id: ").AppendLine(entry.TestRunId?.ToString() ?? "(none)");
-                builder.Append("Created At (UTC): ").AppendLine(entry.CreatedAtUtc.ToString("O"));
-                builder.Append("Kind: ").AppendLine(entry.Kind.ToString());
-                builder.Append("Role: ").AppendLine(entry.Role);
-                builder.Append("Tool Call Id: ").AppendLine(entry.ToolCallId ?? "(none)");
-                builder.Append("Tool Name: ").AppendLine(entry.ToolName ?? "(none)");
+                AppendPairs(builder, ("Entry Id", entry.Id.ToString()), ("Run Id", entry.TestRunId?.ToString() ?? "(none)"), ("Created At (UTC)", entry.CreatedAtUtc.ToString("O")), ("Kind", entry.Kind.ToString()), ("Role", entry.Role), ("Tool Call Id", entry.ToolCallId ?? "(none)"), ("Tool Name", entry.ToolName ?? "(none)"));
                 builder.AppendLine("Content:");
                 AppendMultiline(builder, entry.Content, "  ");
                 builder.AppendLine("Metadata:");
@@ -752,17 +586,56 @@ public sealed class MainWindowViewModel : ObservableObject
         return builder.ToString().TrimEnd();
     }
 
-    private static string BuildTranscriptEntryHeading(TimelineEntry entry) =>
-        entry.Kind switch
+    private static void AppendGoals(StringBuilder builder, IReadOnlyList<GoalItem> goals)
+    {
+        builder.AppendLine("Goals:");
+        if (goals.Count == 0)
         {
-            TimelineItemKind.UserMessage => "You",
-            TimelineItemKind.AssistantMessage => "Assistant",
-            TimelineItemKind.ToolCallStarted => $"Tool Call Started: {entry.ToolName ?? "tool"}",
-            TimelineItemKind.ToolCallFinished => $"Tool Response: {entry.ToolName ?? "tool"}",
-            TimelineItemKind.GoalChanged => "Goal Update",
-            TimelineItemKind.SystemNotice => "System",
-            _ => entry.Kind.ToString(),
-        };
+            builder.AppendLine("  (none)");
+            return;
+        }
+
+        foreach (var goal in goals.OrderBy(item => item.CreatedAtUtc))
+        {
+            builder.Append("  - Goal Id: ").AppendLine(goal.Id.ToString());
+            AppendPairs(builder, ("    Title", goal.Title), ("    Success Criteria", goal.SuccessCriteria), ("    Status", goal.Status.ToString()), ("    Note", goal.Note ?? "(none)"), ("    Evidence", goal.Evidence ?? "(none)"), ("    Created At (UTC)", goal.CreatedAtUtc.ToString("O")), ("    Updated At (UTC)", goal.UpdatedAtUtc.ToString("O")), ("    Completed At (UTC)", goal.CompletedAtUtc?.ToString("O") ?? "(not completed)"));
+        }
+    }
+
+    private static string BuildTranscriptEntryHeading(TimelineEntry entry) => entry.Kind switch
+    {
+        TimelineItemKind.UserMessage => "You",
+        TimelineItemKind.AssistantMessage => "Assistant",
+        TimelineItemKind.ToolCallStarted => $"Tool Call Started: {entry.ToolName ?? "tool"}",
+        TimelineItemKind.ToolCallFinished => $"Tool Response: {entry.ToolName ?? "tool"}",
+        TimelineItemKind.GoalChanged => "Goal Update",
+        TimelineItemKind.SystemNotice => "System",
+        _ => entry.Kind.ToString(),
+    };
+
+    private static void AppendPairs(StringBuilder builder, params (string Label, string? Value)[] pairs)
+    {
+        foreach (var (label, value) in pairs)
+        {
+            builder.Append(label).Append(": ").AppendLine(value);
+        }
+    }
+
+    private static void AppendOptionalPair(StringBuilder builder, string label, string? value)
+    {
+        if (!string.IsNullOrWhiteSpace(value))
+        {
+            builder.Append(label).Append(": ").AppendLine(value);
+        }
+    }
+
+    private static void AppendOptionalLine(StringBuilder builder, string? value)
+    {
+        if (!string.IsNullOrWhiteSpace(value))
+        {
+            builder.AppendLine(value);
+        }
+    }
 
     private static void AppendMultiline(StringBuilder builder, string? value, string indent)
     {
@@ -775,38 +648,21 @@ public sealed class MainWindowViewModel : ObservableObject
 
     private static string TryFormatJson(string rawJson)
     {
-        if (string.IsNullOrWhiteSpace(rawJson))
-        {
-            return rawJson;
-        }
-
-        try
-        {
-            return JsonNode.Parse(rawJson)?.ToJsonString(TranscriptJsonOptions) ?? rawJson;
-        }
-        catch
-        {
-            return rawJson;
-        }
+        try { return string.IsNullOrWhiteSpace(rawJson) ? rawJson : JsonNode.Parse(rawJson)?.ToJsonString(TranscriptJsonOptions) ?? rawJson; }
+        catch { return rawJson; }
     }
 
     private static string BuildExportFileName(ChatSession chat)
     {
-        var invalidCharacters = Path.GetInvalidFileNameChars();
-        var sanitizedTitle = new string(chat.Title.Select(character => invalidCharacters.Contains(character) ? '_' : character).ToArray()).Trim();
-        if (string.IsNullOrWhiteSpace(sanitizedTitle))
-        {
-            sanitizedTitle = "chat";
-        }
-
-        return $"{sanitizedTitle}-{chat.Id:N}.txt";
+        var invalid = Path.GetInvalidFileNameChars();
+        var title = new string(chat.Title.Select(character => invalid.Contains(character) ? '_' : character).ToArray()).Trim();
+        return $"{(string.IsNullOrWhiteSpace(title) ? "chat" : title)}-{chat.Id:N}.txt";
     }
 }
 
 public abstract class ObservableObject : INotifyPropertyChanged
 {
     public event PropertyChangedEventHandler? PropertyChanged;
-
     protected bool SetProperty<T>(ref T field, T value, [CallerMemberName] string? propertyName = null)
     {
         if (EqualityComparer<T>.Default.Equals(field, value))
@@ -815,12 +671,20 @@ public abstract class ObservableObject : INotifyPropertyChanged
         }
 
         field = value;
-        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
+        RaisePropertyChanged(propertyName);
         return true;
     }
 
     protected void RaisePropertyChanged([CallerMemberName] string? propertyName = null) =>
-        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
+        PropertyChanged?.Invoke(this, new(propertyName));
+
+    protected void RaisePropertiesChanged(params string[] propertyNames)
+    {
+        foreach (var propertyName in propertyNames)
+        {
+            RaisePropertyChanged(propertyName);
+        }
+    }
 }
 
 public sealed class RelayCommand(Action execute, Func<bool>? canExecute = null) : ICommand
@@ -836,7 +700,6 @@ public sealed class AsyncRelayCommand(Func<Task> executeAsync, Func<bool>? canEx
     private bool isRunning;
     public event EventHandler? CanExecuteChanged;
     public bool CanExecute(object? parameter) => !isRunning && (canExecute?.Invoke() ?? true);
-
     public async void Execute(object? parameter)
     {
         if (!CanExecute(parameter))
@@ -870,41 +733,26 @@ public sealed class ChatListItemViewModel : ObservableObject
 
     public Guid? Id { get; init; }
     public bool IsDraft { get; init; }
-
-    public string Title
-    {
-        get => title;
-        set => SetProperty(ref title, value);
-    }
-
-    public string Subtitle
-    {
-        get => subtitle;
-        private set => SetProperty(ref subtitle, value);
-    }
+    public string Title { get => title; set => SetProperty(ref title, value); }
+    public string Subtitle { get => subtitle; private set => SetProperty(ref subtitle, value); }
+    public bool ShowSubtitle => !IsDraft && !string.IsNullOrWhiteSpace(Subtitle);
+    public bool HasActiveRuns => !IsDraft && ActiveRuns > 0;
+    public string ActiveRunsText => ActiveRuns == 1 ? "1 active" : $"{ActiveRuns} active";
+    public string CardBackground => IsSelected ? "#183049" : IsDraft ? "#13283A" : "#102030";
+    public string CardBorderBrush => IsSelected ? "#4D7AA6" : IsDraft ? "#31506A" : "#223648";
+    public string TitleBrush => IsSelected ? "#F2F8FF" : "#EAF2FB";
+    public string SubtitleBrush => IsSelected ? "#C6D8EA" : "#88A1B8";
 
     public DateTime UpdatedAtUtc
     {
         get => updatedAtUtc;
-        set
-        {
-            if (SetProperty(ref updatedAtUtc, value))
-            {
-                RefreshDerivedState();
-            }
-        }
+        set { if (SetProperty(ref updatedAtUtc, value)) RefreshDerivedState(); }
     }
 
     public int ActiveRuns
     {
         get => activeRuns;
-        set
-        {
-            if (SetProperty(ref activeRuns, value))
-            {
-                RefreshDerivedState();
-            }
-        }
+        set { if (SetProperty(ref activeRuns, value)) RefreshDerivedState(); }
     }
 
     public bool IsSelected
@@ -914,45 +762,17 @@ public sealed class ChatListItemViewModel : ObservableObject
         {
             if (SetProperty(ref isSelected, value))
             {
-                RaisePropertyChanged(nameof(CardBackground));
-                RaisePropertyChanged(nameof(CardBorderBrush));
-                RaisePropertyChanged(nameof(TitleBrush));
-                RaisePropertyChanged(nameof(SubtitleBrush));
+                RaisePropertiesChanged(nameof(CardBackground), nameof(CardBorderBrush), nameof(TitleBrush), nameof(SubtitleBrush));
             }
         }
     }
 
-    public bool ShowSubtitle => !IsDraft && !string.IsNullOrWhiteSpace(Subtitle);
-    public bool HasActiveRuns => !IsDraft && ActiveRuns > 0;
-    public string ActiveRunsText => ActiveRuns == 1 ? "1 active" : $"{ActiveRuns} active";
-    public string CardBackground => IsSelected ? "#183049" : IsDraft ? "#13283A" : "#102030";
-    public string CardBorderBrush => IsSelected ? "#4D7AA6" : IsDraft ? "#31506A" : "#223648";
-    public string TitleBrush => IsSelected ? "#F2F8FF" : "#EAF2FB";
-    public string SubtitleBrush => IsSelected ? "#C6D8EA" : "#88A1B8";
-
-    public static ChatListItemViewModel CreateDraft() =>
-        new()
-        {
-            IsDraft = true,
-            Title = "New Chat",
-        };
+    public static ChatListItemViewModel CreateDraft() => new() { IsDraft = true, Title = "New Chat" };
 
     private void RefreshDerivedState()
     {
-        if (IsDraft)
-        {
-            Subtitle = string.Empty;
-        }
-        else
-        {
-            Subtitle = UpdatedAtUtc == default
-                ? string.Empty
-                : UpdatedAtUtc.ToLocalTime().ToString("MMM d, h:mm tt");
-        }
-
-        RaisePropertyChanged(nameof(ShowSubtitle));
-        RaisePropertyChanged(nameof(HasActiveRuns));
-        RaisePropertyChanged(nameof(ActiveRunsText));
+        Subtitle = IsDraft || UpdatedAtUtc == default ? string.Empty : UpdatedAtUtc.ToLocalTime().ToString("MMM d, h:mm tt");
+        RaisePropertiesChanged(nameof(ShowSubtitle), nameof(HasActiveRuns), nameof(ActiveRunsText));
     }
 }
 
@@ -975,9 +795,7 @@ public sealed class TimelineItemViewModel : ObservableObject
         toolName = entry.ToolName ?? "tool";
         isRunning = entry.Kind == TimelineItemKind.ToolCallStarted;
         success = entry.Kind != TimelineItemKind.ToolCallFinished || ReadSuccess(entry.MetadataJson);
-        finalSummary = ReadEndTaskValue(entry.ToolName, entry.MetadataJson, "summary");
-        finalTestResults = ReadEndTaskValue(entry.ToolName, entry.MetadataJson, "test_results");
-        finalRemainingWork = ReadEndTaskValue(entry.ToolName, entry.MetadataJson, "remaining_work");
+        ReadFinalReport(entry);
     }
 
     public string ItemKey { get; }
@@ -989,165 +807,80 @@ public sealed class TimelineItemViewModel : ObservableObject
     public bool IsTool => Kind is TimelineItemKind.ToolCallStarted or TimelineItemKind.ToolCallFinished;
     public bool IsGoalChanged => Kind == TimelineItemKind.GoalChanged;
     public bool IsSystem => !IsUserMessage && !IsAssistantMessage && !IsTool && !IsGoalChanged;
-
-    public string Content
-    {
-        get => content;
-        set => SetProperty(ref content, value);
-    }
-
-    public string ToolName
-    {
-        get => toolName;
-        private set
-        {
-            if (SetProperty(ref toolName, value))
-            {
-                RaisePropertyChanged(nameof(DisplayTitle));
-            }
-        }
-    }
-
+    public string Content { get => content; set => SetProperty(ref content, value); }
     public string DisplayTitle => HasFinalReport ? "Run Summary" : ToolName;
-
-    public bool IsRunning
-    {
-        get => isRunning;
-        private set
-        {
-            if (SetProperty(ref isRunning, value))
-            {
-                RaisePropertyChanged(nameof(IsCompleted));
-                RaisePropertyChanged(nameof(StatusText));
-                RaisePropertyChanged(nameof(StatusBrush));
-            }
-        }
-    }
-
     public bool IsCompleted => !IsRunning;
-
-    public bool Success
-    {
-        get => success;
-        private set
-        {
-            if (SetProperty(ref success, value))
-            {
-                RaisePropertyChanged(nameof(StatusText));
-                RaisePropertyChanged(nameof(StatusBrush));
-            }
-        }
-    }
-
     public string StatusText => IsRunning ? "Running" : Success ? "Success" : "Failed";
-
-    public IBrush StatusBrush => IsRunning
-        ? Brushes.Goldenrod
-        : Success
-            ? Brushes.MediumSeaGreen
-            : Brushes.IndianRed;
-
-    public string? FinalSummary
-    {
-        get => finalSummary;
-        private set
-        {
-            if (SetProperty(ref finalSummary, value))
-            {
-                RaiseFinalReportPropertiesChanged();
-            }
-        }
-    }
-
-    public string? FinalTestResults
-    {
-        get => finalTestResults;
-        private set
-        {
-            if (SetProperty(ref finalTestResults, value))
-            {
-                RaiseFinalReportPropertiesChanged();
-            }
-        }
-    }
-
-    public string? FinalRemainingWork
-    {
-        get => finalRemainingWork;
-        private set
-        {
-            if (SetProperty(ref finalRemainingWork, value))
-            {
-                RaiseFinalReportPropertiesChanged();
-            }
-        }
-    }
-
+    public IBrush StatusBrush => IsRunning ? Brushes.Goldenrod : Success ? Brushes.MediumSeaGreen : Brushes.IndianRed;
     public bool HasFinalSummary => !string.IsNullOrWhiteSpace(FinalSummary);
     public bool HasFinalTestResults => !string.IsNullOrWhiteSpace(FinalTestResults);
     public bool HasFinalRemainingWork => !string.IsNullOrWhiteSpace(FinalRemainingWork);
     public bool HasFinalReport => HasFinalSummary || HasFinalTestResults || HasFinalRemainingWork;
 
+    public string ToolName
+    {
+        get => toolName;
+        private set { if (SetProperty(ref toolName, value)) RaisePropertyChanged(nameof(DisplayTitle)); }
+    }
+
+    public bool IsRunning
+    {
+        get => isRunning;
+        private set { if (SetProperty(ref isRunning, value)) RaisePropertiesChanged(nameof(IsCompleted), nameof(StatusText), nameof(StatusBrush)); }
+    }
+
+    public bool Success
+    {
+        get => success;
+        private set { if (SetProperty(ref success, value)) RaisePropertiesChanged(nameof(StatusText), nameof(StatusBrush)); }
+    }
+
+    public string? FinalSummary { get => finalSummary; private set { if (SetProperty(ref finalSummary, value)) RaiseFinalReportPropertiesChanged(); } }
+    public string? FinalTestResults { get => finalTestResults; private set { if (SetProperty(ref finalTestResults, value)) RaiseFinalReportPropertiesChanged(); } }
+    public string? FinalRemainingWork { get => finalRemainingWork; private set { if (SetProperty(ref finalRemainingWork, value)) RaiseFinalReportPropertiesChanged(); } }
+
     public void ApplyFinishedEntry(TimelineEntry entry)
     {
         ToolName = entry.ToolName ?? ToolName;
         Success = ReadSuccess(entry.MetadataJson);
-        FinalSummary = ReadEndTaskValue(entry.ToolName, entry.MetadataJson, "summary");
-        FinalTestResults = ReadEndTaskValue(entry.ToolName, entry.MetadataJson, "test_results");
-        FinalRemainingWork = ReadEndTaskValue(entry.ToolName, entry.MetadataJson, "remaining_work");
+        ReadFinalReport(entry);
         IsRunning = false;
     }
 
-    private void RaiseFinalReportPropertiesChanged()
+    private void ReadFinalReport(TimelineEntry entry)
     {
-        RaisePropertyChanged(nameof(HasFinalSummary));
-        RaisePropertyChanged(nameof(HasFinalTestResults));
-        RaisePropertyChanged(nameof(HasFinalRemainingWork));
-        RaisePropertyChanged(nameof(HasFinalReport));
-        RaisePropertyChanged(nameof(DisplayTitle));
+        FinalSummary = ReadEndTaskValue(entry.ToolName, entry.MetadataJson, "summary");
+        FinalTestResults = ReadEndTaskValue(entry.ToolName, entry.MetadataJson, "test_results");
+        FinalRemainingWork = ReadEndTaskValue(entry.ToolName, entry.MetadataJson, "remaining_work");
     }
+
+    private void RaiseFinalReportPropertiesChanged() =>
+        RaisePropertiesChanged(nameof(HasFinalSummary), nameof(HasFinalTestResults), nameof(HasFinalRemainingWork), nameof(HasFinalReport), nameof(DisplayTitle));
 
     private static bool ReadSuccess(string? metadataJson)
     {
-        if (string.IsNullOrWhiteSpace(metadataJson))
-        {
-            return true;
-        }
-
         try
         {
-            var metadata = JsonNode.Parse(metadataJson)?.AsObject();
-            return metadata?["success"]?.GetValue<bool>()
-                ?? metadata?["Success"]?.GetValue<bool>()
-                ?? true;
+            var metadata = string.IsNullOrWhiteSpace(metadataJson) ? null : JsonNode.Parse(metadataJson)?.AsObject();
+            return metadata?["success"]?.GetValue<bool>() ?? metadata?["Success"]?.GetValue<bool>() ?? true;
         }
         catch
         {
-            return !metadataJson.Contains(@"""success"":false", StringComparison.OrdinalIgnoreCase)
-                && !metadataJson.Contains(@"""Success"":false", StringComparison.OrdinalIgnoreCase);
+            return !metadataJson?.Contains(@"""success"":false", StringComparison.OrdinalIgnoreCase) == true &&
+                   !metadataJson?.Contains(@"""Success"":false", StringComparison.OrdinalIgnoreCase) == true;
         }
     }
 
     private static string? ReadEndTaskValue(string? toolName, string? metadataJson, string propertyName)
     {
-        if (!string.Equals(toolName, "end_task", StringComparison.Ordinal) ||
-            string.IsNullOrWhiteSpace(metadataJson))
+        if (toolName != "end_task" || string.IsNullOrWhiteSpace(metadataJson))
         {
             return null;
         }
 
         try
         {
-            var metadata = JsonNode.Parse(metadataJson)?.AsObject();
-            if (metadata?["data"] is not JsonObject data ||
-                data[propertyName] is not JsonValue value ||
-                !value.TryGetValue<string>(out var text) ||
-                string.IsNullOrWhiteSpace(text))
-            {
-                return null;
-            }
-
-            return text.Trim();
+            return JsonNode.Parse(metadataJson)?["data"]?[propertyName]?.GetValue<string>()?.Trim();
         }
         catch
         {
@@ -1165,25 +898,9 @@ public sealed class GoalItemViewModel : ObservableObject
     public Guid Id { get; init; }
     public string Title { get; init; } = string.Empty;
     public string SuccessCriteria { get; init; } = string.Empty;
-
-    public GoalStatus Status
-    {
-        get => status;
-        set
-        {
-            if (SetProperty(ref status, value))
-            {
-                RaisePropertyChanged(nameof(StatusText));
-                RaisePropertyChanged(nameof(StatusBrush));
-            }
-        }
-    }
-
     public string? Note { get => note; set => SetProperty(ref note, value); }
     public string? Evidence { get => evidence; set => SetProperty(ref evidence, value); }
-
     public string StatusText => Status.ToString();
-
     public IBrush StatusBrush => Status switch
     {
         GoalStatus.Passed => Brushes.MediumSeaGreen,
@@ -1191,4 +908,10 @@ public sealed class GoalItemViewModel : ObservableObject
         GoalStatus.Running => Brushes.Goldenrod,
         _ => Brushes.SlateGray,
     };
+
+    public GoalStatus Status
+    {
+        get => status;
+        set { if (SetProperty(ref status, value)) RaisePropertiesChanged(nameof(StatusText), nameof(StatusBrush)); }
+    }
 }
